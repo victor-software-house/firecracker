@@ -114,6 +114,11 @@ where
         vsock.acked_features = state.virtio_state.acked_features;
         vsock.avail_features = state.virtio_state.avail_features;
         vsock.device_state = DeviceState::Inactive;
+        // Every snapshot is written right after `prepare_save` published a
+        // TRANSPORT_RESET event, so a restored guest has one to acknowledge.
+        // Upstream persists this flag; this build restores it as set, which
+        // keeps the snapshot format of Firecracker 1.16.1.
+        vsock.pending_event_ack = true;
         Ok(vsock)
     }
 }
@@ -183,6 +188,7 @@ pub(crate) mod tests {
         .unwrap();
 
         assert_eq!(restored_device.device_type(), VirtioDeviceType::Vsock);
+        assert!(restored_device.pending_event_ack);
         assert_eq!(restored_device.avail_features_by_page(0), device_pages[0]);
         assert_eq!(restored_device.avail_features_by_page(1), device_pages[1]);
         assert_eq!(restored_device.avail_features_by_page(2), 0);
