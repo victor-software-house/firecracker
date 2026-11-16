@@ -1,0 +1,576 @@
+pagemap-diff
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: A diff snapshot without dirty tracking writes the pages the guest wrote, read from the host page tables, so boxes can restore without dirty logging and keep 2 MiB pages.
+Upstream-Status: not-submitted
+Drop-When: Upstream Firecracker takes a diff snapshot without dirty tracking from the page tables, and its jailer gives the jailed process its own /proc.
+---
+ docs/jailer.md                        |    6 +
+ docs/snapshotting/snapshot-support.md |   15 +-
+ src/jailer/src/env.rs                 |   89 +++++++++
+ src/jailer/src/main.rs                |    2 
+ src/vmm/src/vstate/vm.rs              |  316 +++++++++++++++++++++++++++++----
+ 5 files changed, 384 insertions(+), 44 deletions(-)
+
+diff --git a/docs/jailer.md b/docs/jailer.md
+index fa5e8b4ee769f64ee83a317dce5902ffd0029a1b..23eb27ec494ebac3791761261c136b31d3bc7188 100644
+--- a/docs/jailer.md
++++ b/docs/jailer.md
+@@ -139,6 +139,12 @@ After starting, the Jailer goes through the following operations:
+   and call `chroot` into the current directory.
+ - Use `mknod` to create a `/dev/net/tun` equivalent inside the jail.
+ - Use `mknod` to create a `/dev/kvm` equivalent inside the jail.
++- Create `/proc` with mode `0555` and mount a procfs on it with
++  `MS_NOSUID | MS_NODEV | MS_NOEXEC` and the options
++  `hidepid=invisible,subset=pid`. A process sees only the pids of its own uid,
++  so the jailed Firecracker sees only itself, and no `/proc` entry that is not a
++  pid other than `self` and `thread-self`. Firecracker reads
++  `/proc/self/pagemap` to take a diff snapshot without dirty page tracking.
+ - Use `chown` to change ownership of the `<chroot_dir>` (root path `/` as seen
+   by the jailed firecracker), `/dev/net/tun`, `/dev/kvm`. The ownership is
+   changed to the provided `<uid>:<gid>`.
+diff --git a/docs/snapshotting/snapshot-support.md b/docs/snapshotting/snapshot-support.md
+index 0b72879051c49f3eae0142e59f7fe4a11490c45b..d624c1bb3891ba00c05973bbe0748d118664b7ab 100644
+--- a/docs/snapshotting/snapshot-support.md
++++ b/docs/snapshotting/snapshot-support.md
+@@ -321,12 +321,14 @@ when configuring the `/machine-config` resource or when restoring from a
+ snapshot via `/snapshot/load`, Firecracker will use KVM's dirty page log runtime
+ functionality to ensure the diff snapshot only contains exactly pages that were
+ written to since boot / snapshot restoration. If `track_dirty_pages` is not
+-enabled, Firecracker uses the [`mincore(2)`][man mincore] syscall to determine
+-which pages to include in the snapshot. As such, this mode of snapshot taking
+-will only work _if swap is disabled_, as mincore does not consider pages written
+-to swap to be "in core". This potentially results in bigger memory files
+-(although they are still sparse), but avoids the runtime overhead of dirty page
+-logging.
++enabled, Firecracker reads `/proc/self/pagemap` to determine which pages to
++include in the snapshot. The page set holds every page the guest wrote,
++including pages the host has swapped out. A page the guest only read from the
++snapshot file it was restored from is left out. This avoids the runtime overhead
++of dirty page logging, but the set does not reset after a snapshot: the next
++diff holds every page written since the microVM was restored, not only those
++written since that snapshot. Under the [jailer](../jailer.md), the jailer mounts
++the `/proc` that Firecracker reads.
+ 
+ > [!NOTE]
+ >
+@@ -729,4 +731,3 @@ For example, a snapshot taken on a m6i.metal host (Intel Ice Lake) running a
+ host kernel (but not vice versa), but could not be restored on a m5n.metal host
+ (Intel Cascade Lake).
+ 
+-[man mincore]: https://man7.org/linux/man-pages/man2/mincore.2.html
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index 7c595058313f9cfc57a9850d2c3fbbf05ba5acd5..712840fa67b5345dce9976291a008e9ebef7ae4e 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -16,10 +16,10 @@ use utils::time::{ClockType, get_time_us};
+ use utils::{arg_parser, validators};
+ use vmm_sys_util::syscall::SyscallReturnCode;
+ 
+-use crate::JailerError;
+ use crate::cgroup::{CgroupConfiguration, CgroupConfigurationBuilder};
+ use crate::chroot::chroot;
+ use crate::resource_limits::{FSIZE_ARG, NO_FILE_ARG, ResourceLimits};
++use crate::{JailerError, to_cstring};
+ 
+ pub const PROC_MOUNTS: &str = "/proc/mounts";
+ 
+@@ -70,6 +70,13 @@ const DEV_NE_MAJOR: u32 = 10;
+ const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
+ const FOLDER_PERMISSIONS: u32 = 0o700;
+ 
++// The procfs the jailed process reads its own /proc/self/pagemap from. With `hidepid=invisible`
++// a process sees only the pids of its own uid, which is itself in the jail, and `subset=pid`
++// hides every entry of /proc that is not a pid, other than `self` and `thread-self`.
++const PROC_DIR: &str = "/proc";
++const PROC_PERMISSIONS: u32 = 0o555;
++const PROC_MOUNT_OPTIONS: &CStr = c"hidepid=invisible,subset=pid";
++
+ // When running with `--new-pid-ns` flag, the PID of the process running the exec_file differs
+ // from jailer's and it is stored inside a dedicated file, prefixed with the below extension.
+ const PID_FILE_EXTENSION: &str = ".pid";
+@@ -496,6 +503,28 @@ impl Env {
+             .map_err(|err| JailerError::ChangeFileOwner(folder_path.to_owned(), err))
+     }
+ 
++    /// Creates `proc_dir` and mounts a procfs on it that shows the process only itself.
++    fn mount_proc(proc_dir: &Path) -> Result<(), JailerError> {
++        fs::create_dir_all(proc_dir)
++            .map_err(|err| JailerError::CreateDir(proc_dir.to_owned(), err))?;
++        fs::set_permissions(proc_dir, Permissions::from_mode(PROC_PERMISSIONS))
++            .map_err(|err| JailerError::Chmod(proc_dir.to_owned(), err))?;
++
++        let target = to_cstring(proc_dir)?;
++        // SAFETY: Safe because we provide valid, null-terminated parameters.
++        SyscallReturnCode(unsafe {
++            libc::mount(
++                c"proc".as_ptr(),
++                target.as_ptr(),
++                c"proc".as_ptr(),
++                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
++                PROC_MOUNT_OPTIONS.as_ptr().cast(),
++            )
++        })
++        .into_empty_result()
++        .map_err(JailerError::MountProc)
++    }
++
+     fn copy_exec_to_chroot(&mut self) -> Result<OsString, JailerError> {
+         let exec_file_name = self
+             .exec_file_path
+@@ -715,6 +744,9 @@ impl Env {
+                 println!("MMDS version 2 will not be available to use.");
+             });
+ 
++        // Firecracker reads /proc/self/pagemap to take a diff snapshot without dirty page tracking.
++        Env::mount_proc(Path::new(PROC_DIR))?;
++
+         // If we have a minor version for /dev/userfaultfd the device is present on the host.
+         // Expose the device in the jailed environment.
+         if let Some(minor) = self.uffd_dev_minor {
+@@ -1506,4 +1538,59 @@ mod tests {
+         fs::remove_file(pid_file_name).unwrap();
+         assert_eq!(stored_pid.unwrap(), "1");
+     }
++
++    #[test]
++    fn test_mount_proc() {
++        // Like the jailer, the test thread unshares into a mount namespace of its own, so the
++        // mount never reaches the host's.
++        // SAFETY: Safe because we provide valid parameters.
++        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, 0);
++        // SAFETY: Safe because we provide valid parameters.
++        assert_eq!(
++            unsafe {
++                libc::mount(
++                    std::ptr::null(),
++                    c"/".as_ptr(),
++                    std::ptr::null(),
++                    libc::MS_PRIVATE | libc::MS_REC,
++                    std::ptr::null(),
++                )
++            },
++            0
++        );
++
++        let tmp_dir = TempDir::new().unwrap();
++        let proc_dir = tmp_dir.as_path().join("proc");
++        Env::mount_proc(&proc_dir).unwrap();
++
++        // The mount shows only the pid directories, with the flags and options the jailer sets.
++        let mountinfo = read_to_string("/proc/thread-self/mountinfo").unwrap();
++        let mount_point = proc_dir.to_str().unwrap();
++        let line = mountinfo
++            .lines()
++            .find(|line| line.split(' ').nth(4) == Some(mount_point))
++            .unwrap();
++        let (mount, filesystem) = line.split_once(" - ").unwrap();
++        let mount_options: Vec<_> = mount.split(' ').nth(5).unwrap().split(',').collect();
++        for option in ["nosuid", "nodev", "noexec"] {
++            assert!(mount_options.contains(&option), "{option} in {line}");
++        }
++        let filesystem: Vec<_> = filesystem.split(' ').collect();
++        assert_eq!(filesystem[0], "proc");
++        let super_options: Vec<_> = filesystem[2].split(',').collect();
++        for option in ["hidepid=invisible", "subset=pid"] {
++            assert!(super_options.contains(&option), "{option} in {line}");
++        }
++        assert!(proc_dir.join("self/pagemap").exists());
++        assert!(!proc_dir.join("meminfo").exists());
++
++        // The directory below the mount has the mode the jailer gives it.
++        let target = to_cstring(&proc_dir).unwrap();
++        // SAFETY: Safe because we provide valid parameters.
++        assert_eq!(unsafe { libc::umount2(target.as_ptr(), 0) }, 0);
++        assert_eq!(
++            fs::metadata(&proc_dir).unwrap().permissions().mode(),
++            PROC_PERMISSIONS | libc::S_IFDIR
++        );
++    }
+ }
+diff --git a/src/jailer/src/main.rs b/src/jailer/src/main.rs
+index 0daed7db7c8008f16abab186bb7eaa7e37ba855c..8d45b449fec784594cddaa041513eb9bb3ac8275 100644
+--- a/src/jailer/src/main.rs
++++ b/src/jailer/src/main.rs
+@@ -104,6 +104,8 @@ pub enum JailerError {
+     MknodDev(io::Error, String),
+     #[error("Failed to bind mount the jail root directory: {0}")]
+     MountBind(io::Error),
++    #[error("Failed to mount procfs inside the jail: {0}")]
++    MountProc(io::Error),
+     #[error("Failed to change the propagation type to slave: {0}")]
+     MountPropagationSlave(io::Error),
+     #[error("{}", format!("{:?} is not a file", .0).replace('\"', ""))]
+diff --git a/src/vmm/src/vstate/vm.rs b/src/vmm/src/vstate/vm.rs
+index d515a0e026633dc8f79f1412a84bab942852579d..1e2fbf94859477043e8eab907ee1463a449d9c6f 100644
+--- a/src/vmm/src/vstate/vm.rs
++++ b/src/vmm/src/vstate/vm.rs
+@@ -7,7 +7,7 @@
+ 
+ use std::collections::HashMap;
+ use std::fs::{File, OpenOptions};
+-use std::io::Write;
++use std::io::{Read, Seek, SeekFrom, Write};
+ use std::os::unix::fs::OpenOptionsExt;
+ use std::path::Path;
+ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+@@ -127,8 +127,8 @@ pub enum VmError {
+     NotEnoughMemorySlots(u32),
+     /// Failed to add a memory region: {0}
+     InsertRegion(#[from] vm_memory::GuestRegionCollectionError),
+-    /// Error calling mincore: {0}
+-    Mincore(vmm_sys_util::errno::Error),
++    /// Failed to read /proc/self/pagemap: {0}
++    PagemapRead(#[source] std::io::Error),
+     /// ResourceAllocator error: {0}
+     ResourceAllocator(#[from] vm_allocator::Error),
+     /// MemoryError error: {0}
+@@ -609,7 +609,11 @@ impl KvmVm {
+     }
+ 
+     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
++    ///
++    /// A slot without dirty tracking takes its page set from `/proc/self/pagemap`, which this
++    /// opens once for all of the slots.
+     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
++        let mut pagemap: Option<File> = None;
+         self.guest_memory()
+             .iter()
+             .flat_map(|region| region.plugged_slots())
+@@ -619,10 +623,16 @@ impl KvmVm {
+                         .fd()
+                         .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
+                         .map_err(VmError::GetDirtyLog)?,
+-                    None => mincore_bitmap(
+-                        mem_slot.slice.ptr_guard_mut().as_ptr(),
+-                        mem_slot.slice.len(),
+-                    )?,
++                    None => {
++                        if pagemap.is_none() {
++                            pagemap = Some(File::open(PAGEMAP_PATH).map_err(VmError::PagemapRead)?);
++                        }
++                        pagemap_bitmap(
++                            pagemap.as_mut().expect("opened above"),
++                            mem_slot.slice.ptr_guard_mut().as_ptr(),
++                            mem_slot.slice.len(),
++                        )?
++                    }
+                 };
+                 Ok((mem_slot.slot, bitmap))
+             })
+@@ -893,36 +903,55 @@ fn open_evicting(
+     }
+ }
+ 
+-/// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
+-/// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
+-fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
+-    // TODO: Once Host 5.10 goes out of support, we can make this more robust and work on
+-    // swap-enabled systems, by doing mlock2(MLOCK_ONFAULT)/munlock() in this function (to
+-    // force swapped-out pages to get paged in, so that mincore will consider them incore).
+-    // However, on AMD (m6a/m7a) 5.10, doing so introduces a 100%/30ms regression to snapshot
+-    // creation, even if swap is disabled, so currently it cannot be done.
+-
+-    // Mincore always works at PAGE_SIZE granularity, even if the VMA we are dealing with
+-    // is a hugetlbfs VMA (e.g. to report a single hugepage as "present", mincore will
+-    // give us 512 4k markers with the lowest bit set).
+-    let page_size = host_page_size();
+-    let mut mincore_bitmap = vec![0u8; len / page_size];
+-    let mut bitmap = vec![0u64; (len / page_size).div_ceil(64)];
+-
+-    // SAFETY: The safety invariants of GuestRegionMmap ensure that region.as_ptr() is a valid
+-    // userspace mapping of size region.len() bytes. The bitmap has exactly one byte for each
+-    // page in this userspace mapping. Note that mincore does not operate on bitmaps like
+-    // KVM_MEM_LOG_DIRTY_PAGES, but rather it uses 8 bits per page (e.g. 1 byte), setting the
+-    // least significant bit to 1 if the page corresponding to a byte is in core (available in
+-    // the page cache and resolvable via just a minor page fault).
+-    let r = unsafe { libc::mincore(addr.cast(), len, mincore_bitmap.as_mut_ptr()) };
+-
+-    if r != 0 {
+-        return Err(VmError::Mincore(vmm_sys_util::errno::Error::last()));
+-    }
++/// The file the VMM reads to tell the pages the guest wrote from the pages it only read.
++const PAGEMAP_PATH: &str = "/proc/self/pagemap";
++/// A `/proc/<pid>/pagemap` entry: the page is present in RAM.
++const PAGEMAP_PRESENT: u64 = 1 << 63;
++/// A `/proc/<pid>/pagemap` entry: the page is in swap.
++const PAGEMAP_SWAPPED: u64 = 1 << 62;
++/// A `/proc/<pid>/pagemap` entry: the page is a file page or shared anonymous.
++const PAGEMAP_FILE_OR_SHARED: u64 = 1 << 61;
++/// How many `pagemap` entries one `read` fetches.
++const PAGEMAP_CHUNK_ENTRIES: usize = 8192;
++
++/// Whether the page that a `/proc/<pid>/pagemap` entry describes holds data the guest wrote.
++///
++/// A page of a private mapping that the guest wrote is an anonymous copy, either present or in
++/// swap. A page it only read stays a page of the file, which has bit 61 set. An absent page, with
++/// no bit set, holds nothing the guest wrote.
++fn pagemap_entry_written(entry: u64) -> bool {
++    entry & PAGEMAP_SWAPPED != 0
++        || (entry & PAGEMAP_PRESENT != 0 && entry & PAGEMAP_FILE_OR_SHARED == 0)
++}
+ 
+-    for (page_idx, b) in mincore_bitmap.iter().enumerate() {
+-        bitmap[page_idx / 64] |= (*b as u64 & 0x1) << (page_idx as u64 % 64);
++/// Reads the pages the guest wrote in the memslot at `addr`, `len` bytes long, from the
++/// `/proc/self/pagemap` file `pagemap`, as a bitmap with one bit for each page. To be used if a
++/// diff snapshot is requested, but dirty page tracking wasn't enabled.
++///
++/// The set holds every page written since the memory was mapped, swapped out ones included, and
++/// no page that was only read from the file backing a private mapping. It does not reset after a
++/// snapshot, as KVM's dirty log does.
++fn pagemap_bitmap(pagemap: &mut File, addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
++    let page_size = host_page_size();
++    let pages = len / page_size;
++    let mut bitmap = vec![0u64; pages.div_ceil(64)];
++
++    // The file holds one 8 byte entry for each page of the address space.
++    let offset = (addr as usize / page_size) as u64 * 8;
++    pagemap
++        .seek(SeekFrom::Start(offset))
++        .map_err(VmError::PagemapRead)?;
++
++    let mut entries = vec![0u8; PAGEMAP_CHUNK_ENTRIES.min(pages) * 8];
++    let mut page_idx = 0;
++    while page_idx < pages {
++        let chunk = &mut entries[..PAGEMAP_CHUNK_ENTRIES.min(pages - page_idx) * 8];
++        pagemap.read_exact(chunk).map_err(VmError::PagemapRead)?;
++        for entry in chunk.chunks_exact(8) {
++            let entry = u64::from_ne_bytes(entry.try_into().expect("chunks of 8 bytes"));
++            bitmap[page_idx / 64] |= u64::from(pagemap_entry_written(entry)) << (page_idx % 64);
++            page_idx += 1;
++        }
+     }
+ 
+     Ok(bitmap)
+@@ -931,9 +960,11 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
+ #[cfg(test)]
+ pub(crate) mod tests {
+     use std::assert_matches;
++    use std::os::fd::AsRawFd;
+     use std::sync::atomic::Ordering;
+ 
+     use vm_memory::GuestAddress;
++    use vmm_sys_util::tempfile::TempFile;
+ 
+     use super::*;
+     use crate::arch;
+@@ -1402,4 +1433,217 @@ pub(crate) mod tests {
+             .unwrap();
+         assert_eq!(range + 1024, range_new.start());
+     }
++
++    #[test]
++    fn test_pagemap_entry_written() {
++        // Each entry also carries a page frame number or swap offset in its low bits.
++        let table = [
++            ("present anonymous", PAGEMAP_PRESENT | 0x1234, true),
++            (
++                "present file",
++                PAGEMAP_PRESENT | PAGEMAP_FILE_OR_SHARED | 0x1234,
++                false,
++            ),
++            ("swapped", PAGEMAP_SWAPPED | 0x1234, true),
++            ("absent", 0, false),
++            ("absent with a stale frame number", 0x1234, false),
++            (
++                "present with bit 61 set",
++                PAGEMAP_PRESENT | PAGEMAP_FILE_OR_SHARED,
++                false,
++            ),
++        ];
++        for (name, entry, written) in table {
++            assert_eq!(pagemap_entry_written(entry), written, "{name}");
++        }
++    }
++
++    /// The pages of a bitmap that are set.
++    fn set_pages(bitmap: &[u64]) -> Vec<usize> {
++        (0..bitmap.len() * 64)
++            .filter(|page| (bitmap[page / 64] >> (page % 64)) & 1 == 1)
++            .collect()
++    }
++
++    /// Maps `pages` pages of `fd` (or anonymous memory without it) privately, read and write.
++    fn map_private(fd: Option<&File>, pages: usize) -> *mut u8 {
++        let flags = match fd {
++            Some(_) => libc::MAP_PRIVATE,
++            None => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
++        };
++        // SAFETY: Anonymous or file-backed mapping with a null hint and a valid descriptor, which
++        // the tests unmap with `unmap`.
++        let addr = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                pages * host_page_size(),
++                libc::PROT_READ | libc::PROT_WRITE,
++                flags,
++                fd.map_or(-1, |fd| fd.as_raw_fd()),
++                0,
++            )
++        };
++        assert_ne!(addr, libc::MAP_FAILED);
++        // No huge page may make a write present in the pages around it.
++        // SAFETY: The range was mapped just above.
++        let ret = unsafe { libc::madvise(addr, pages * host_page_size(), libc::MADV_NOHUGEPAGE) };
++        assert_eq!(ret, 0);
++        addr.cast()
++    }
++
++    fn unmap(addr: *mut u8, pages: usize) {
++        // SAFETY: `addr` came from `map_private` with the same number of pages.
++        let ret = unsafe { libc::munmap(addr.cast(), pages * host_page_size()) };
++        assert_eq!(ret, 0);
++    }
++
++    #[test]
++    fn test_pagemap_bitmap_private_file_mapping() {
++        const PAGES: usize = 8;
++        let page_size = host_page_size();
++        let mut file = TempFile::new().unwrap().into_file();
++        file.write_all(&vec![0x5a; PAGES * page_size]).unwrap();
++        let addr = map_private(Some(&file), PAGES);
++
++        // The guest reads pages 1 and 3 and writes pages 2 and 5. A page that was only read stays
++        // a page of the file.
++        for page in [1, 3] {
++            // SAFETY: `page` lies within the mapping.
++            assert_eq!(unsafe { addr.add(page * page_size).read_volatile() }, 0x5a);
++        }
++        for page in [2, 5] {
++            // SAFETY: `page` lies within the mapping.
++            unsafe { addr.add(page * page_size).write_volatile(0x42) };
++        }
++
++        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
++        let bitmap = pagemap_bitmap(&mut pagemap, addr, PAGES * page_size).unwrap();
++        assert_eq!(set_pages(&bitmap), [2, 5]);
++        unmap(addr, PAGES);
++    }
++
++    #[test]
++    fn test_pagemap_bitmap_anonymous_mapping() {
++        const PAGES: usize = 8;
++        let page_size = host_page_size();
++        let addr = map_private(None, PAGES);
++
++        // Pages 1 and 6 are written. Page 4 is only read, which maps the zero page: it counts as
++        // written and the merge of a diff punches it out, since it reads as zeros.
++        for page in [1, 6] {
++            // SAFETY: `page` lies within the mapping.
++            unsafe { addr.add(page * page_size).write_volatile(0x42) };
++        }
++        // SAFETY: Page 4 lies within the mapping.
++        assert_eq!(unsafe { addr.add(4 * page_size).read_volatile() }, 0);
++
++        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
++        let bitmap = pagemap_bitmap(&mut pagemap, addr, PAGES * page_size).unwrap();
++        assert_eq!(set_pages(&bitmap), [1, 4, 6]);
++        unmap(addr, PAGES);
++    }
++
++    #[test]
++    fn test_pagemap_bitmap_spans_chunks() {
++        // Two chunks of entries and a partial third, with pages written on both sides of each
++        // chunk's edge.
++        let pages = PAGEMAP_CHUNK_ENTRIES * 2 + 100;
++        let page_size = host_page_size();
++        let addr = map_private(None, pages);
++        let written = [
++            0,
++            PAGEMAP_CHUNK_ENTRIES - 1,
++            PAGEMAP_CHUNK_ENTRIES,
++            2 * PAGEMAP_CHUNK_ENTRIES - 1,
++            2 * PAGEMAP_CHUNK_ENTRIES,
++            pages - 1,
++        ];
++        for page in written {
++            // SAFETY: `page` lies within the mapping.
++            unsafe { addr.add(page * page_size).write_volatile(0x42) };
++        }
++
++        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
++        let bitmap = pagemap_bitmap(&mut pagemap, addr, pages * page_size).unwrap();
++        assert_eq!(set_pages(&bitmap), written);
++        unmap(addr, pages);
++    }
++
++    /// A guest whose vCPU writes pages 3, 5, 6 and 12 of its memory and reads pages 8 and 9,
++    /// with dirty tracking on over a private mapping of a file. Every page that KVM's dirty log
++    /// holds is in the page set that `pagemap_bitmap` reads, and both are the written pages.
++    #[cfg(target_arch = "x86_64")]
++    #[test]
++    fn test_pagemap_bitmap_holds_kvm_dirty_log() {
++        use kvm_ioctls::VcpuExit;
++
++        use crate::vstate::memory::snapshot_file;
++
++        const PAGES: usize = 16;
++        const WRITTEN: [usize; 4] = [3, 5, 6, 12];
++        const READ: [usize; 2] = [8, 9];
++        let page_size = host_page_size();
++
++        // A real mode program: `mov byte [addr], 0x42` for each written page, `mov al, [addr]`
++        // for each page it reads, then `hlt`, which exits to this thread as no irqchip exists.
++        let address = |page: usize| u16::try_from(page * page_size).unwrap().to_le_bytes();
++        let mut program = Vec::new();
++        for page in WRITTEN {
++            program.extend([0xc6, 0x06]);
++            program.extend(address(page));
++            program.push(0x42);
++        }
++        for page in READ {
++            program.push(0xa0);
++            program.extend(address(page));
++        }
++        program.push(0xf4);
++
++        let mut memory = vec![0x5a; PAGES * page_size];
++        memory[..program.len()].copy_from_slice(&program);
++        let mut file = TempFile::new().unwrap().into_file();
++        file.write_all(&memory).unwrap();
++        let regions = snapshot_file(
++            file,
++            [(GuestAddress(0), PAGES * page_size)].into_iter(),
++            true,
++            HugePageConfig::None,
++        )
++        .unwrap();
++        let mut vm = setup_vm();
++        vm.register_dram_memory_regions(regions).unwrap();
++
++        let mut vcpu = vm.fd().create_vcpu(0).unwrap();
++        let mut sregs = vcpu.get_sregs().unwrap();
++        sregs.cs.base = 0;
++        sregs.cs.selector = 0;
++        vcpu.set_sregs(&sregs).unwrap();
++        let mut regs = vcpu.get_regs().unwrap();
++        regs.rip = 0;
++        regs.rflags = 2;
++        vcpu.set_regs(&regs).unwrap();
++        assert!(matches!(vcpu.run().unwrap(), VcpuExit::Hlt));
++
++        let slot = vm
++            .guest_memory()
++            .iter()
++            .flat_map(|region| region.plugged_slots())
++            .next()
++            .unwrap();
++        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
++        let from_pagemap = pagemap_bitmap(
++            &mut pagemap,
++            slot.slice.ptr_guard_mut().as_ptr(),
++            slot.slice.len(),
++        )
++        .unwrap();
++        let from_kvm = vm.get_dirty_bitmap().unwrap().remove(&slot.slot).unwrap();
++
++        let logged = set_pages(&from_kvm);
++        assert_eq!(logged, WRITTEN);
++        for page in &logged {
++            assert!(set_pages(&from_pagemap).contains(page), "page {page}");
++        }
++        assert_eq!(set_pages(&from_pagemap), WRITTEN);
++    }
+ }
