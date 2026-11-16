@@ -1,0 +1,62 @@
+%YAML 1.2
+---
+schema: 2
+downstream:
+  remote: origin
+  branch: downstream-1.16.1
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/firecracker-microvm/firecracker.git
+  fetch_ref: refs/heads/firecracker-v1.16
+base:
+  target:
+    type: tag
+    selector: refs/tags/v1.16.1
+    commit: 2038188f145fb81b8d098147a10e9d9f392fd22f
+    tag_object: e527ccfc54495dabac96f1835db61a40afa15115
+  canonical: 2038188f145fb81b8d098147a10e9d9f392fd22f
+  stack: 2038188f145fb81b8d098147a10e9d9f392fd22f
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: pit-reinject-off
+    layer: source
+    purpose: >-
+      KVM starts the in-kernel PIT in reinject mode, which inhibits AVIC for the
+      whole VM on AMD hosts, so every interrupt and IPI exits to the host. The patch turns
+      reinjection off with KVM_REINJECT_CONTROL after create_pit2.
+    upstream_status: not-submitted
+    drop_when: Upstream turns PIT reinjection off or makes it configurable.
+    scope:
+      - src/vmm/src/arch/x86_64/vm.rs
+  - name: vsock-bare-resume
+    layer: source
+    purpose: >-
+      Vmm::resume_vm kicks every virtio device, and in 1.16.1 the vsock kick sets
+      pending_event_ack at once, so after a bare pause and resume no host-initiated
+      connection reaches the guest, which never acknowledges a TRANSPORT_RESET. The patch
+      keeps the vsock RX open and leaves the snapshot format as 1.16.1 wrote it.
+    upstream_status: "merged: upstream pull request 6100 and its 1.16 backport 6182, released in 1.16.2 with a snapshot format change"
+    drop_when: The build moves to a Firecracker release with pull request 6100.
+    scope:
+      - src/vmm/src/devices/virtio/vsock/device.rs
+      - src/vmm/src/devices/virtio/vsock/persist.rs
+  - name: fork-tooling
+    layer: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []

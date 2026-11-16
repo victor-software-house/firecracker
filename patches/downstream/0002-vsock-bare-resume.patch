@@ -1,0 +1,170 @@
+vsock-bare-resume
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Vmm::resume_vm kicks every virtio device, and in 1.16.1 the vsock kick sets pending_event_ack at once, so after a bare pause and resume no host-initiated connection reaches the guest, which never acknowledges a TRANSPORT_RESET. The patch keeps the vsock RX open and leaves the snapshot format as 1.16.1 wrote it.
+Upstream-Status: merged: upstream pull request 6100 and its 1.16 backport 6182, released in 1.16.2 with a snapshot format change
+Drop-When: The build moves to a Firecracker release with pull request 6100.
+---
+ src/vmm/src/devices/virtio/vsock/device.rs  |   86 +++++++++++++++++++--------
+ src/vmm/src/devices/virtio/vsock/persist.rs |    6 ++
+ 2 files changed, 68 insertions(+), 24 deletions(-)
+
+diff --git a/src/vmm/src/devices/virtio/vsock/device.rs b/src/vmm/src/devices/virtio/vsock/device.rs
+index d855523e30b87b72df31c53adf2dc34d9d6d07b2..a77c9156c5f51fb0626804c1abec02a4b02a5dfb 100644
+--- a/src/vmm/src/devices/virtio/vsock/device.rs
++++ b/src/vmm/src/devices/virtio/vsock/device.rs
+@@ -404,21 +404,30 @@ where
+ 
+     fn kick(&mut self) {
+         if self.is_activated() {
+-            self.pending_event_ack = true;
+-
+             // Vsock has a complicated protocol that isn't resilient to any packet loss,
+             // so for Vsock we don't support connection persistence through snapshot. Any
+             // in-flight packets or events are simply lost and Vsock is restored 'empty'.
+-            // We signal the event queue to make the guest process the
+-            // `TRANSPORT_RESET_EVENT` event we sent during snapshot creation. (We signal
+-            // it host->guest rather than writing its eventfd, which would invoke the
++            //
++            // A set `pending_event_ack` means a `TRANSPORT_RESET_EVENT` sits in the
++            // event queue's used ring, not yet acknowledged by the guest: we are
++            // resuming either the VM a snapshot was just taken from, or a VM restored
++            // from a snapshot (the flag is part of the persisted device state). Signal
++            // the event queue so the guest processes the event. (We signal it
++            // host->guest rather than writing its eventfd, which would invoke the
+             // guest's reset-ack path and clear `pending_event_ack` prematurely.)
+-            info!(
+-                "[{:?}:{}] signaling event queue",
+-                self.device_type(),
+-                self.id()
+-            );
+-            self.signal_used_queue(EVQ_INDEX).unwrap();
++            //
++            // On a bare pause/resume no reset event was published, so there is nothing
++            // to signal and the flag must stay clear: arming it here would gate
++            // `process_rx` on an acknowledgment the guest can never send, hanging all
++            // subsequent host-initiated connections.
++            if self.pending_event_ack {
++                info!(
++                    "[{:?}:{}] signaling event queue",
++                    self.device_type(),
++                    self.id()
++                );
++                self.signal_used_queue(EVQ_INDEX).unwrap();
++            }
+ 
+             // Replay the TX queue notification, like the default `VirtioDevice::kick`
+             // does for its data queues, so the device re-processes any TX descriptor
+@@ -428,9 +437,11 @@ where
+             // Under EVENT_IDX the guest only notifies us when `avail_idx` crosses
+             // `avail_event`; since it is already past, the guest considers itself to
+             // have notified us and stays silent, so we never process the queue and
+-            // guest-to-host connections hang. RX needs no replay: it is gated by
+-            // `pending_event_ack` until the guest acks the reset, and the host pulls
+-            // from the backend rather than waiting on a guest RX notification.
++            // guest-to-host connections hang. RX needs no replay: on the snapshot path
++            // it is gated by `pending_event_ack` until the guest acks the reset (which
++            // drains RX and re-arms `avail_event`), on a bare resume the RX queue
++            // state was never disturbed, and in both cases the host pulls from the
++            // backend rather than waiting on a guest RX notification.
+             info!(
+                 "[{:?}:{}] notifying tx queue",
+                 self.device_type(),
+@@ -618,35 +629,62 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_kick_when_active_arms_pending_event_ack() {
++    fn test_kick_preserves_armed_pending_event_ack() {
+         // Restore path: kick() is invoked after the snapshot is loaded to re-deliver the
+-        // TRANSPORT_RESET interrupt. It must arm the RX gate so the post-restore RX/EVQ
+-        // race cannot deliver data ahead of the guest ack.
++        // TRANSPORT_RESET interrupt. The RX gate, restored from the snapshot state, must
++        // stay armed so the post-restore RX/EVQ race cannot deliver data ahead of the
++        // guest ack.
+         let test_ctx = TestContext::new();
+         let mut ctx = test_ctx.create_event_handler_context();
+         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+ 
+-        ctx.device.pending_event_ack = false;
++        ctx.device.pending_event_ack = true;
+         ctx.device.kick();
+ 
+         assert!(
+             ctx.device.pending_event_ack,
+-            "kick() on an active device must arm the RX gate"
++            "kick() must keep the RX gate armed while a reset ack is outstanding"
+         );
+ 
+-        // After kick(), the gate must actually suppress RX delivery.
++        // The gate must actually suppress RX delivery.
+         ctx.device.backend.set_pending_rx(true);
+         let progressed = ctx.device.process_rx().unwrap();
+         assert!(!progressed);
+         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+     }
+ 
++    #[test]
++    fn test_bare_resume_kick_leaves_rx_ungated() {
++        // Bare pause/resume path: no TRANSPORT_RESET was published, so kick() must not
++        // arm the RX gate. Arming it would block RX forever, as the guest never acks an
++        // event it never received, and new host-initiated connections would hang.
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_event_handler_context();
++        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
++
++        assert!(!ctx.device.pending_event_ack);
++        ctx.device.kick();
++
++        assert!(
++            !ctx.device.pending_event_ack,
++            "kick() must not arm the RX gate when no reset ack is outstanding"
++        );
++
++        // RX delivery must still work after the kick.
++        ctx.device.backend.set_pending_rx(true);
++        let progressed = ctx.device.process_rx().unwrap();
++        assert!(progressed, "RX must flow after a bare resume");
++        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
++    }
++
+     #[test]
+     fn test_kick_replays_tx_notification_only() {
+-        // On restore, kick() must replay only the TX data queue (to re-process in-flight
+-        // TX and re-arm avail_event). RX is gated by pending_event_ack so it needs no
+-        // replay, and the event queue's data eventfd must not be notified -- that is the
+-        // guest's TRANSPORT_RESET ack path; the event queue is signaled host->guest.
++        // On resume, kick() must replay only the TX data queue (to re-process in-flight
++        // TX and re-arm avail_event). RX needs no replay: on the snapshot path it is
++        // gated by pending_event_ack until the guest acks the reset, and on a bare
++        // resume its queue state was never disturbed. The event queue's data eventfd
++        // must not be notified either -- that is the guest's TRANSPORT_RESET ack path;
++        // the event queue is signaled host->guest.
+         let test_ctx = TestContext::new();
+         let mut ctx = test_ctx.create_event_handler_context();
+         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+diff --git a/src/vmm/src/devices/virtio/vsock/persist.rs b/src/vmm/src/devices/virtio/vsock/persist.rs
+index 42909b58ddb774de13b9874755f91eb8aa45ca14..7556abdf922961ff46dcd36557c4a37625f4cbfe 100644
+--- a/src/vmm/src/devices/virtio/vsock/persist.rs
++++ b/src/vmm/src/devices/virtio/vsock/persist.rs
+@@ -114,6 +114,11 @@ where
+         vsock.acked_features = state.virtio_state.acked_features;
+         vsock.avail_features = state.virtio_state.avail_features;
+         vsock.device_state = DeviceState::Inactive;
++        // Every snapshot is written right after `prepare_save` published a
++        // TRANSPORT_RESET event, so a restored guest has one to acknowledge.
++        // Upstream persists this flag; this build restores it as set, which
++        // keeps the snapshot format of Firecracker 1.16.1.
++        vsock.pending_event_ack = true;
+         Ok(vsock)
+     }
+ }
+@@ -183,6 +188,7 @@ pub(crate) mod tests {
+         .unwrap();
+ 
+         assert_eq!(restored_device.device_type(), VirtioDeviceType::Vsock);
++        assert!(restored_device.pending_event_ack);
+         assert_eq!(restored_device.avail_features_by_page(0), device_pages[0]);
+         assert_eq!(restored_device.avail_features_by_page(1), device_pages[1]);
+         assert_eq!(restored_device.avail_features_by_page(2), 0);

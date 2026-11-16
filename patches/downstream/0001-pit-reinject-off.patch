@@ -1,0 +1,75 @@
+pit-reinject-off
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: KVM starts the in-kernel PIT in reinject mode, which inhibits AVIC for the whole VM on AMD hosts, so every interrupt and IPI exits to the host. The patch turns reinjection off with KVM_REINJECT_CONTROL after create_pit2.
+Upstream-Status: not-submitted
+Drop-When: Upstream turns PIT reinjection off or makes it configurable.
+---
+ src/vmm/src/arch/x86_64/vm.rs |   29 +++++++++++++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/src/vmm/src/arch/x86_64/vm.rs b/src/vmm/src/arch/x86_64/vm.rs
+index 21467777abea88b0b095c56b6ecbfd3b012c7400..12a960475112474df32c17e7d48fa188a2cf6077 100644
+--- a/src/vmm/src/arch/x86_64/vm.rs
++++ b/src/vmm/src/arch/x86_64/vm.rs
+@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
+ use kvm_bindings::{
+     KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
+     KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2,
++    kvm_reinject_control,
+ };
+ use kvm_ioctls::Cap;
+ use serde::{Deserialize, Serialize};
++use vmm_sys_util::ioctl::ioctl_with_ref;
+ 
+ use crate::arch::x86_64::msr::MsrError;
+ use crate::snapshot::Persist;
+@@ -20,6 +22,11 @@ use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryState};
+ use crate::vstate::resources::ResourceAllocator;
+ use crate::vstate::vm::{VmCommon, VmError};
+ 
++mod reinject {
++    // include/uapi/linux/kvm.h: #define KVM_REINJECT_CONTROL _IO(KVMIO, 0x71)
++    vmm_sys_util::ioctl_io_nr!(KVM_REINJECT_CONTROL, kvm_bindings::KVMIO, 0x71);
++}
++
+ /// Error type for [`KvmVm::restore_state`]
+ #[allow(missing_docs)]
+ #[cfg(target_arch = "x86_64")]
+@@ -164,7 +171,8 @@ impl KvmVm {
+         Ok(())
+     }
+ 
+-    /// Creates the irq chip and an in-kernel device model for the PIT.
++    /// Creates the irq chip and an in-kernel device model for the PIT, with tick
++    /// reinjection off.
+     pub fn setup_irqchip(&self) -> Result<(), KvmVmError> {
+         self.fd()
+             .create_irq_chip()
+@@ -177,7 +185,24 @@ impl KvmVm {
+         };
+         self.fd()
+             .create_pit2(pit_config)
+-            .map_err(KvmVmError::VmSetIrqChip)
++            .map_err(KvmVmError::VmSetIrqChip)?;
++        // KVM creates the PIT reinjecting missed ticks, and on AMD it inhibits
++        // APICv (AVIC) while the PIT reinjects, since AVIC does not trap the EOI
++        // writes reinjection waits for (arch/x86/kvm/i8254.c,
++        // kvm_pit_set_reinject). Every interrupt and IPI then exits to the host.
++        // A guest that keeps time with kvm-clock and the local APIC timer counts
++        // no PIT ticks, so reinjection goes off and AVIC stays on.
++        let control = kvm_reinject_control {
++            pit_reinject: 0,
++            ..Default::default()
++        };
++        // SAFETY: the fd is this VM's, which now has a PIT, and the kernel reads
++        // exactly one kvm_reinject_control from the reference.
++        let ret = unsafe { ioctl_with_ref(self.fd(), reinject::KVM_REINJECT_CONTROL(), &control) };
++        if ret != 0 {
++            return Err(KvmVmError::VmSetIrqChip(kvm_ioctls::Error::last()));
++        }
++        Ok(())
+     }
+ 
+     /// Saves and returns the KVM VM state.
