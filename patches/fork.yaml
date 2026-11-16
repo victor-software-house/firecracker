@@ -1,0 +1,71 @@
+%YAML 1.2
+---
+schema: 2
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/firecracker-microvm/firecracker.git
+  fetch_ref: refs/heads/firecracker-v1.18
+base:
+  target:
+    type: tag
+    selector: refs/tags/v1.18.0
+    commit: eaf83bb718a559d324613d566eaf776b31a62340
+    tag_object: 07a7c2e20a8f4f661702551d02fc3eca679842a5
+  canonical: eaf83bb718a559d324613d566eaf776b31a62340
+  stack: eaf83bb718a559d324613d566eaf776b31a62340
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: pit-reinject-off
+    layer: source
+    purpose: >-
+      KVM starts the in-kernel PIT in reinject mode, which inhibits AVIC for the
+      whole VM on AMD hosts, so every interrupt and IPI exits to the host. The patch turns
+      reinjection off with KVM_REINJECT_CONTROL after create_pit2.
+    upstream_status: not-submitted
+    drop_when: Upstream turns PIT reinjection off or makes it configurable.
+    scope:
+      - src/vmm/src/arch/x86_64/vm.rs
+  - name: memslots-before-vcpus
+    layer: source
+    purpose: "Register memslots before vCPUs to skip KVM's SRCU wait on restore. Backport of upstream PR 6388 (commits 7b8d58a, 0ac6af3, 9585897): on Linux 6.18 or newer, a memslot update after the irqchip registers on the io bus waits for an SRCU grace period, about 20 ms on AMD hosts."
+    upstream_status: merged upstream (PR 6388)
+    drop_when: The fork moves to a Firecracker release that contains PR 6388.
+    scope:
+      - src/vmm/src/arch/aarch64/vcpu.rs
+      - src/vmm/src/arch/aarch64/vm.rs
+      - src/vmm/src/arch/x86_64/vm.rs
+      - src/vmm/src/builder.rs
+      - src/vmm/src/device_manager/mod.rs
+      - src/vmm/src/device_manager/pci_mngr.rs
+      - src/vmm/src/device_manager/persist.rs
+      - src/vmm/src/vstate/vm.rs
+  - name: thp-file-restore
+    layer: source
+    purpose: "Map snapshot file holes anonymously so a File restore with huge_pages Transparent gets transparent huge pages. Backport of upstream PR 6396 (commit a8e98e79): a private file mapping is never backed by THP, so each 2 MiB-aligned run of holes in the memory file is mapped anonymously and advised MADV_HUGEPAGE; data pages stay file-backed."
+    upstream_status: submitted upstream (PR 6396)
+    drop_when: The fork moves to a Firecracker release that contains PR 6396.
+    scope:
+      - src/vmm/src/vstate/memory.rs
+  - name: fork-tooling
+    layer: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []
