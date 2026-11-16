@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{
     KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
     KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2,
+    kvm_reinject_control,
 };
 use kvm_ioctls::Cap;
 use serde::{Deserialize, Serialize};
+use vmm_sys_util::ioctl::ioctl_with_ref;
 
 use crate::arch::x86_64::msr::MsrError;
 use crate::snapshot::Persist;
@@ -19,6 +21,11 @@ use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryState};
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vm::{VmCommon, VmError};
+
+mod reinject {
+    // include/uapi/linux/kvm.h: #define KVM_REINJECT_CONTROL _IO(KVMIO, 0x71)
+    vmm_sys_util::ioctl_io_nr!(KVM_REINJECT_CONTROL, kvm_bindings::KVMIO, 0x71);
+}
 
 /// Error type for [`KvmVm::restore_state`]
 #[allow(missing_docs)]
@@ -164,7 +171,8 @@ impl KvmVm {
         Ok(())
     }
 
-    /// Creates the irq chip and an in-kernel device model for the PIT.
+    /// Creates the irq chip and an in-kernel device model for the PIT, with tick
+    /// reinjection off.
     pub fn setup_irqchip(&self) -> Result<(), KvmVmError> {
         self.fd()
             .create_irq_chip()
@@ -177,7 +185,24 @@ impl KvmVm {
         };
         self.fd()
             .create_pit2(pit_config)
-            .map_err(KvmVmError::VmSetIrqChip)
+            .map_err(KvmVmError::VmSetIrqChip)?;
+        // KVM creates the PIT reinjecting missed ticks, and on AMD it inhibits
+        // APICv (AVIC) while the PIT reinjects, since AVIC does not trap the EOI
+        // writes reinjection waits for (arch/x86/kvm/i8254.c,
+        // kvm_pit_set_reinject). Every interrupt and IPI then exits to the host.
+        // A guest that keeps time with kvm-clock and the local APIC timer counts
+        // no PIT ticks, so reinjection goes off and AVIC stays on.
+        let control = kvm_reinject_control {
+            pit_reinject: 0,
+            ..Default::default()
+        };
+        // SAFETY: the fd is this VM's, which now has a PIT, and the kernel reads
+        // exactly one kvm_reinject_control from the reference.
+        let ret = unsafe { ioctl_with_ref(self.fd(), reinject::KVM_REINJECT_CONTROL(), &control) };
+        if ret != 0 {
+            return Err(KvmVmError::VmSetIrqChip(kvm_ioctls::Error::last()));
+        }
+        Ok(())
     }
 
     /// Saves and returns the KVM VM state.
