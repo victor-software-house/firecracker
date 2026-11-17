@@ -45,7 +45,7 @@ use crate::devices::virtio::mem::persist::VirtioMemPersistError;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::NetPersistError;
 use crate::devices::virtio::pmem::device::Pmem;
-use crate::devices::virtio::pmem::persist::PmemPersistError;
+use crate::devices::virtio::pmem::persist::{PmemConstructorArgs, PmemPersistError, PmemState};
 use crate::devices::virtio::rng::persist::EntropyPersistError;
 use crate::devices::virtio::vsock::{VsockError, VsockUnixBackendError};
 use crate::logger::info;
@@ -674,6 +674,39 @@ pub struct DevicesState {
     pub serial_state: Option<persist::SerialState>,
 }
 
+impl DevicesState {
+    /// Restore the pmem devices of this state. Each one registers a memslot, so this runs before
+    /// the vCPUs are created and the result is handed to [`DeviceManager::restore`], see
+    /// [`KvmVm::create_vcpus`].
+    pub fn restore_pmem_devices(
+        &self,
+        vm: &Arc<KvmVm>,
+        mem: &GuestMemoryMmap,
+    ) -> Result<Vec<Pmem>, DeviceManagerPersistError> {
+        let states: Vec<&PmemState> = match &self.virtio_state {
+            VirtioDevicesState::Mmio(state) => {
+                state.pmem_devices.iter().map(|s| &s.device_state).collect()
+            }
+            VirtioDevicesState::Pci(state) => {
+                state.pmem_devices.iter().map(|s| &s.device_state).collect()
+            }
+        };
+        states
+            .into_iter()
+            .map(|state| {
+                Pmem::restore(
+                    PmemConstructorArgs {
+                        mem,
+                        vm: vm.clone(),
+                    },
+                    state,
+                )
+                .map_err(DeviceManagerPersistError::PmemRestore)
+            })
+            .collect()
+    }
+}
+
 /// Errors for (de)serialization of the devices.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DevicePersistError {
@@ -702,8 +735,6 @@ pub enum DevicePersistError {
     MmdsConfig(#[from] MmdsConfigError),
     /// Entropy: {0}
     Entropy(#[from] EntropyPersistError),
-    /// Pmem: {0}
-    Pmem(#[from] PmemPersistError),
     /// virtio-mem: {0}
     VirtioMem(#[from] VirtioMemPersistError),
     /// Could not activate device: {0}
@@ -725,6 +756,8 @@ pub enum DeviceManagerPersistError {
     Bus(#[from] BusError),
     /// Error creating DeviceManager: {0}
     DeviceManager(#[from] DeviceManagerCreateError),
+    /// Error restoring pmem devices: {0}
+    PmemRestore(#[from] PmemPersistError),
 }
 
 pub struct DeviceRestoreArgs<'a> {
@@ -734,6 +767,8 @@ pub struct DeviceRestoreArgs<'a> {
     pub vcpus_exit_evt: &'a EventFd,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
+    /// Pmem devices already restored with [`DevicesState::restore_pmem_devices`].
+    pub pmem_devices: Vec<Pmem>,
 }
 
 impl std::fmt::Debug for DeviceRestoreArgs<'_> {
@@ -743,6 +778,7 @@ impl std::fmt::Debug for DeviceRestoreArgs<'_> {
             .field("vm", &self.vm)
             .field("vm_resources", &self.vm_resources)
             .field("instance_id", &self.instance_id)
+            .field("pmem_devices", &self.pmem_devices)
             .finish()
     }
 }
@@ -809,6 +845,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                     event_manager: constructor_args.event_manager,
+                    pmem_devices: constructor_args.pmem_devices,
                 };
                 let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
@@ -821,6 +858,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     event_manager: constructor_args.event_manager,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
+                    pmem_devices: constructor_args.pmem_devices,
                 };
                 let mmio_virtio_devices = MMIOVirtioDevices::restore(mmio_ctor_args, mmio_state)
                     .map_err(DeviceManagerPersistError::MmioRestore)?;

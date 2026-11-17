@@ -22,7 +22,7 @@ use crate::devices::virtio::mem::persist::{VirtioMemConstructorArgs, VirtioMemSt
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::{NetConstructorArgs, NetState};
 use crate::devices::virtio::pmem::device::Pmem;
-use crate::devices::virtio::pmem::persist::{PmemConstructorArgs, PmemState};
+use crate::devices::virtio::pmem::persist::PmemState;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::rng::persist::{EntropyConstructorArgs, EntropyState};
 use crate::devices::virtio::transport::pci::device::{
@@ -343,6 +343,8 @@ pub struct PciDevicesConstructorArgs<'a> {
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
     pub event_manager: &'a mut EventManager,
+    /// Pmem devices already restored with `DevicesState::restore_pmem_devices`.
+    pub pmem_devices: Vec<Pmem>,
 }
 
 impl<'a> Debug for PciDevicesConstructorArgs<'a> {
@@ -352,6 +354,7 @@ impl<'a> Debug for PciDevicesConstructorArgs<'a> {
             .field("mem", &self.mem)
             .field("vm_resources", &self.vm_resources)
             .field("instance_id", &self.instance_id)
+            .field("pmem_devices", &self.pmem_devices)
             .finish()
     }
 }
@@ -643,14 +646,13 @@ impl<'a> Persist<'a> for PciDevices {
             )?
         }
 
-        for pmem_state in &state.pmem_devices {
-            let device = Arc::new(Mutex::new(Pmem::restore(
-                PmemConstructorArgs {
-                    mem,
-                    vm: constructor_args.vm.clone(),
-                },
-                &pmem_state.device_state,
-            )?));
+        // The pmem devices were restored from this state, see `DevicesState::restore_pmem_devices`.
+        assert_eq!(
+            constructor_args.pmem_devices.len(),
+            state.pmem_devices.len()
+        );
+        for (pmem_state, pmem) in state.pmem_devices.iter().zip(constructor_args.pmem_devices) {
+            let device = Arc::new(Mutex::new(pmem));
 
             constructor_args
                 .vm_resources
@@ -841,12 +843,16 @@ mod tests {
         };
         let vm_resources = &mut VmResources::default();
         let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
+        let pmem_devices = device_manager_state
+            .restore_pmem_devices(&kvm_vm, kvm_vm.guest_memory())
+            .unwrap();
         let restore_args = PciDevicesConstructorArgs {
             vm: &kvm_vm,
             mem: kvm_vm.guest_memory(),
             vm_resources,
             instance_id: "microvm-id",
             event_manager: &mut event_manager,
+            pmem_devices,
         };
         let _restored_dev_manager = PciDevices::restore(restore_args, pci_state).unwrap();
 
