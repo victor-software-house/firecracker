@@ -336,6 +336,8 @@ pub struct GuestRegionMmap {
     /// Held for its `Drop` impl which unmaps the guest memory region.
     _region: RawGuestRegionMmap,
     proxy: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
+    /// The madvise advice given to the whole region, which a remap of part of it gives again.
+    madvise_flags: libc::c_int,
 }
 
 impl Deref for GuestRegionMmap {
@@ -396,6 +398,7 @@ impl GuestRegionMmap {
             _region: region,
             proxy: vm_memory::GuestRegionMmap::new(mmap_region, guest_base)
                 .ok_or(MemoryError::VmMemoryError)?,
+            madvise_flags: libc::MADV_NORMAL,
         })
     }
 }
@@ -784,6 +787,12 @@ impl GuestRegionMmapExt {
         Ok(())
     }
 
+    /// Whether the region maps a snapshot memory file privately, where a page the guest has not
+    /// written reads the file and a discard maps anonymous memory over the range.
+    pub(crate) fn is_private_file_mapping(&self) -> bool {
+        self.inner.file_offset().is_some() && self.inner.flags() & libc::MAP_PRIVATE != 0
+    }
+
     pub(crate) fn discard_range(
         &self,
         caddr: MemoryRegionAddress,
@@ -798,10 +807,10 @@ impl GuestRegionMmapExt {
             ));
         }
 
-        match (self.inner.file_offset(), self.inner.flags()) {
+        match self.is_private_file_mapping() {
             // If and only if we are resuming from a snapshot file, we have a file and it's mapped
             // private
-            (Some(_), flags) if flags & libc::MAP_PRIVATE != 0 => {
+            true => {
                 // Mmap a new anonymous region over the present one in order to create a hole
                 // with zero pages.
                 // This workaround is (only) needed after resuming from a snapshot file because the
@@ -811,10 +820,9 @@ impl GuestRegionMmapExt {
                 // it's zeroed.
                 // Keep MAP_NORESERVE to match the flags the region was created with (see `create`).
                 // Without it the replacement is subject to overcommit accounting and can fail with
-                // ENOMEM, by which point MAP_FIXED has already unmapped the range.
-                // TODO: this does not re-apply the region's madvise flags, so it would drop the
-                // MADV_HUGEPAGE hint on a THP + file-restore VM. That combination is unsupported
-                // today; revisit if it becomes supported.
+                // ENOMEM, by which point MAP_FIXED has already unmapped the range. The new mapping
+                // gets the region's madvise advice again, so a THP + file-restore VM keeps its
+                // MADV_HUGEPAGE hint over the discarded range.
                 //
                 // Map each intersecting slot directly to its final protection: fully unplugged
                 // slots get PROT_NONE, plugged (or mixed) slots stay PROT_READ | PROT_WRITE. This
@@ -863,6 +871,16 @@ impl GuestRegionMmapExt {
                             std::io::Error::last_os_error()
                         );
                     }
+                    let advice = self.inner.madvise_flags;
+                    if advice != libc::MADV_NORMAL {
+                        // SAFETY: the range was mapped just above.
+                        let ret = unsafe { libc::madvise(ret, u64_to_usize(end - start), advice) };
+                        if ret != 0 {
+                            let os_error = std::io::Error::last_os_error();
+                            error!("discard_range: madvise failed: {:?}", os_error);
+                            return Err(GuestMemoryError::IOError(os_error));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -872,7 +890,7 @@ impl GuestRegionMmapExt {
             // (or in general MAP_SHARED of a fd). In those cases we should use
             // fallocate64(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE).
             // We keep falling to the madvise branch to keep the previous behaviour.
-            _ => {
+            false => {
                 // Madvise the region in order to mark it as not used.
                 let host_addr = self.get_host_address(caddr)?;
                 // SAFETY: The address and length are known to be valid.
@@ -948,7 +966,7 @@ pub fn create(
     let file = file.map(Arc::new);
     regions
         .map(|(start, size)| {
-            let guest_memory = GuestRegionMmap::allocate(
+            let mut guest_memory = GuestRegionMmap::allocate(
                 start,
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
@@ -972,6 +990,7 @@ pub fn create(
                 if ret != 0 {
                     return Err(MemoryError::Madvise(io::Error::last_os_error()));
                 }
+                guest_memory.madvise_flags = madvise_flags;
             }
             Ok(guest_memory)
         })
@@ -1536,6 +1555,33 @@ mod tests {
 
     /// The mappings of `/proc/self/maps` that overlap `[start, end)`, as
     /// `(start, end, backed by a file)`.
+    /// Whether the mapping that holds `addr` carries MADV_HUGEPAGE, shown as `hg` in its
+    /// `VmFlags` line of /proc/self/smaps.
+    fn huge_page_advised(addr: u64) -> bool {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        for line in smaps.lines() {
+            if let Some(flags) = line.strip_prefix("VmFlags:") {
+                if inside {
+                    return flags.split_whitespace().any(|flag| flag == "hg");
+                }
+            } else if let Some((lo, hi)) = line
+                .split_whitespace()
+                .next()
+                .and_then(|range| range.split_once('-'))
+                .and_then(|(lo, hi)| {
+                    Some((
+                        u64::from_str_radix(lo, 16).ok()?,
+                        u64::from_str_radix(hi, 16).ok()?,
+                    ))
+                })
+            {
+                inside = lo <= addr && addr < hi;
+            }
+        }
+        panic!("no mapping holds {addr:#x}");
+    }
+
     fn mappings_in(start: u64, end: u64) -> Vec<(u64, u64, bool)> {
         std::fs::read_to_string("/proc/self/maps")
             .unwrap()
@@ -2175,6 +2221,33 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::InvalidGuestAddress(_)
         );
+    }
+
+    #[test]
+    fn test_discard_range_on_file_keeps_huge_page_advice() {
+        let size = mib_to_bytes(4);
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        memory_file.write_all(&vec![2u8; size]).unwrap();
+        let mem = into_region_ext(
+            snapshot_file(
+                memory_file,
+                std::iter::once((GuestAddress(0), size)),
+                false,
+                HugePageConfig::Transparent,
+            )
+            .unwrap(),
+        );
+        let host = mem.get_host_address(GuestAddress(0)).unwrap() as u64;
+        assert!(huge_page_advised(host));
+
+        mem.discard_range(GuestAddress(0), mib_to_bytes(2)).unwrap();
+
+        // The discarded range is anonymous now, and keeps the region's MADV_HUGEPAGE.
+        assert_eq!(
+            mappings_in(host, host + mib_to_bytes(2) as u64),
+            [(host, host + mib_to_bytes(2) as u64, false)]
+        );
+        assert!(huge_page_advised(host));
     }
 
     #[test]

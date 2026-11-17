@@ -328,6 +328,7 @@ def validate_fc_metrics(metrics):
             "plug_count",
             "plug_bytes",
             "plug_fails",
+            "plug_discard_fails",
             {"plug_agg": latency_agg_metrics_fields},
             "unplug_count",
             "unplug_bytes",
