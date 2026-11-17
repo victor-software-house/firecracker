@@ -641,6 +641,7 @@ impl KvmVm {
 
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
+        let mut merges_into_file = false;
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -669,6 +670,8 @@ impl KvmVm {
             if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
+            } else {
+                merges_into_file = true;
             }
         }
 
@@ -679,7 +682,12 @@ impl KvmVm {
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
-                self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+                // A diff merged into the full memory file punches a hole for each dirty page that
+                // reads as zero, such as a page the guest freed since the last snapshot, so the
+                // file frees that disk space instead of storing the zeros. A separate diff layer
+                // keeps writing them, since a hole there marks a page the layer does not hold.
+                self.guest_memory()
+                    .dump_dirty(&mut file, &dirty_bitmap, merges_into_file)?;
             }
             SnapshotType::Full => {
                 self.guest_memory().dump(&mut file)?;

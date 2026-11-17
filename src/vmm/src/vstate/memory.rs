@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io;
 use std::io::SeekFrom;
 use std::ops::Deref;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
 
@@ -90,6 +90,8 @@ pub enum MemoryError {
     DirtyBitmapTooSmall,
     /// Seek error: {0}
     SeekError(std::io::Error),
+    /// Cannot punch a hole in the snapshot memory file: {0}
+    PunchHole(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
 }
@@ -443,14 +445,20 @@ impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
 }
 
 impl<'a> GuestMemorySlot<'a> {
-    /// Dumps the dirty pages in this slot onto the writer
-    pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
+    /// Dumps the dirty pages in this slot onto the writer. With `punch_zero_pages`, each run of
+    /// dirty pages that read as zero becomes a hole in the file instead of written zeros.
+    pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek + AsFd>(
         &self,
         writer: &mut T,
         kvm_bitmap: &[u64],
         page_size: usize,
+        punch_zero_pages: bool,
     ) -> Result<(), MemoryError> {
         let firecracker_bitmap = self.slice.bitmap();
+        let mut page = Vec::new();
+        if punch_zero_pages {
+            page.resize(page_size / std::mem::size_of::<u64>(), 0u64);
+        }
         let mut write_size = 0;
         let mut skip_size = 0;
         let mut dirty_batch_start = 0;
@@ -498,8 +506,7 @@ impl<'a> GuestMemorySlot<'a> {
                     // We are at the end of a batch of dirty pages.
                     if write_size > 0 {
                         // Dump the dirty pages.
-                        let slice = &self.slice.subslice(dirty_batch_start, write_size)?;
-                        writer.write_all_volatile(slice)?;
+                        self.write_dirty_run(writer, dirty_batch_start, write_size, &mut page)?;
                         write_size = 0;
                     }
                     skip_size += page_size;
@@ -508,7 +515,7 @@ impl<'a> GuestMemorySlot<'a> {
         }
 
         if write_size > 0 {
-            writer.write_all_volatile(&self.slice.subslice(dirty_batch_start, write_size)?)?;
+            self.write_dirty_run(writer, dirty_batch_start, write_size, &mut page)?;
         }
 
         // Advance the cursor even if the trailing pages are clean, so that the
@@ -519,6 +526,49 @@ impl<'a> GuestMemorySlot<'a> {
                 .map_err(MemoryError::SeekError)?;
         }
 
+        Ok(())
+    }
+
+    /// Writes the `len` bytes of dirty pages at `offset` in this slot at the writer's position.
+    /// An empty `page` writes them all. Otherwise `page` holds one page, and each run of pages
+    /// that read as zero, such as pages the guest freed and the balloon discarded, becomes a hole
+    /// punched in the file, which reads back as the same zeros without taking disk space.
+    fn write_dirty_run<T: WriteVolatile + std::io::Seek + AsFd>(
+        &self,
+        writer: &mut T,
+        offset: usize,
+        len: usize,
+        page: &mut [u64],
+    ) -> Result<(), MemoryError> {
+        let page_size = std::mem::size_of_val(page);
+        if page_size == 0 {
+            writer.write_all_volatile(&self.slice.subslice(offset, len)?)?;
+            return Ok(());
+        }
+        let mut is_zero = |at: usize| -> Result<bool, MemoryError> {
+            self.slice.subslice(at, page_size)?.copy_to(page);
+            Ok(page.iter().all(|&word| word == 0))
+        };
+        let end = offset + len;
+        let mut start = offset;
+        while start < end {
+            let zero = is_zero(start)?;
+            let mut stop = start + page_size;
+            while stop < end && is_zero(stop)? == zero {
+                stop += page_size;
+            }
+            let run = self.slice.subslice(start, stop - start)?;
+            if !zero {
+                writer.write_all_volatile(&run)?;
+            } else if let Err(err) = punch_hole(writer, run.len()) {
+                // A file system without hole punching gets the zeros written, as before.
+                if err.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    return Err(MemoryError::PunchHole(err));
+                }
+                writer.write_all_volatile(&run)?;
+            }
+            start = stop;
+        }
         Ok(())
     }
 
@@ -1111,11 +1161,15 @@ where
     /// Dumps all contents of GuestMemoryMmap to a writer.
     fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
 
-    /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
-    fn dump_dirty<T: WriteVolatile + std::io::Seek>(
+    /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer. With
+    /// `punch_zero_pages`, a dirty page that reads as zero is punched out of the file as a hole
+    /// instead of written, which suits only a writer that is the full memory file the diff merges
+    /// into: in a separate diff layer a hole marks a page the diff does not hold.
+    fn dump_dirty<T: WriteVolatile + std::io::Seek + AsFd>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
+        punch_zero_pages: bool,
     ) -> Result<(), MemoryError>;
 
     /// Resets all the memory region bitmaps
@@ -1214,10 +1268,11 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
-    fn dump_dirty<T: WriteVolatile + std::io::Seek>(
+    fn dump_dirty<T: WriteVolatile + std::io::Seek + AsFd>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
+        punch_zero_pages: bool,
     ) -> Result<(), MemoryError> {
         let page_size = host_page_size();
 
@@ -1235,7 +1290,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                         let kvm_bitmap = dirty_bitmap
                             .get(&mem_slot.slot)
                             .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
-                        mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?;
+                        mem_slot.dump_dirty(writer, kvm_bitmap, page_size, punch_zero_pages)?;
                     }
                     Ok(())
                 });
@@ -1328,6 +1383,27 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             region.check_range_plugged(offset, chunk_len)
         })
     }
+}
+
+/// Punches a hole of `len` bytes at the writer's position, which then reads as zeros, and moves
+/// the position past it.
+fn punch_hole<T: std::io::Seek + AsFd>(writer: &mut T, len: usize) -> io::Result<()> {
+    let offset = i64::try_from(writer.stream_position()?).map_err(io::Error::other)?;
+    let len = i64::try_from(len).map_err(io::Error::other)?;
+    // SAFETY: fallocate on a descriptor the writer owns, with no pointer arguments.
+    let ret = unsafe {
+        libc::fallocate(
+            writer.as_fd().as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset,
+            len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    writer.seek(SeekFrom::Current(len))?;
+    Ok(())
 }
 
 fn create_memfd(
@@ -1826,7 +1902,7 @@ mod tests {
 
         let mut file = TempFile::new().unwrap().into_file();
         guest_memory
-            .dump_dirty(&mut file, &kvm_dirty_bitmap)
+            .dump_dirty(&mut file, &kvm_dirty_bitmap, false)
             .unwrap();
 
         // We can restore from this because this is the first dirty dump.
@@ -1866,7 +1942,7 @@ mod tests {
         kvm_dirty_bitmap.insert(1, vec![0b10]);
 
         guest_memory
-            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap, false)
             .unwrap();
 
         // Check that only the dirty regions are dumped.
@@ -1901,7 +1977,7 @@ mod tests {
 
         let mut reader = file.into_file();
         guest_memory
-            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap, false)
             .unwrap();
 
         // Check that only the dirty regions are dumped.
@@ -1930,21 +2006,77 @@ mod tests {
         kvm_dirty_bitmap.insert(0, vec![0b1, 0b01]);
         kvm_dirty_bitmap.insert(1, vec![0b10]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false),
             Err(MemoryError::DirtyBitmapTooLarge)
         ));
         kvm_dirty_bitmap.insert(0, vec![0b01]);
         kvm_dirty_bitmap.insert(1, vec![0b110]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false),
             Err(MemoryError::DirtyBitmapTooLarge)
         ));
         kvm_dirty_bitmap.insert(0, vec![]);
         kvm_dirty_bitmap.insert(1, vec![0b10]);
         assert!(matches!(
-            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap, false),
             Err(MemoryError::DirtyBitmapTooSmall)
         ));
+    }
+
+    #[test]
+    fn test_dump_dirty_punches_discarded_pages() {
+        let page_size = host_page_size();
+        let size = 4 * page_size;
+        let ones = vec![1u8; page_size];
+        let zeros = vec![0u8; page_size];
+
+        for punch_zero_pages in [false, true] {
+            // A guest restored from a memory file writes every page, then frees page 1, which the
+            // balloon discards.
+            let mut base = TempFile::new().unwrap().into_file();
+            base.write_all(&vec![2u8; size]).unwrap();
+            let guest_memory = into_region_ext(
+                snapshot_file(
+                    base,
+                    std::iter::once((GuestAddress(0), size)),
+                    true,
+                    HugePageConfig::None,
+                )
+                .unwrap(),
+            );
+            guest_memory
+                .write(&vec![1u8; size], GuestAddress(0))
+                .unwrap();
+            guest_memory
+                .discard_range(GuestAddress(page_size as u64), page_size)
+                .unwrap();
+            let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+            kvm_dirty_bitmap.insert(0, vec![0b1111]);
+
+            // The diff merges into a full memory file of the guest's size.
+            let mut merged = TempFile::new().unwrap().into_file();
+            merged.write_all(&vec![3u8; size]).unwrap();
+            merged.seek(SeekFrom::Start(0)).unwrap();
+            guest_memory
+                .dump_dirty(&mut merged, &kvm_dirty_bitmap, punch_zero_pages)
+                .unwrap();
+            assert_eq!(merged.stream_position().unwrap(), size as u64);
+
+            let mut contents = Vec::new();
+            merged.seek(SeekFrom::Start(0)).unwrap();
+            merged.read_to_end(&mut contents).unwrap();
+            assert_eq!(
+                contents,
+                [&ones[..], &zeros[..], &ones[..], &ones[..]].concat()
+            );
+
+            // Punching leaves the discarded page a hole; writing stores its zeros.
+            let stored_pages = if punch_zero_pages { 3 } else { 4 };
+            assert_eq!(
+                merged.metadata().unwrap().blocks() * 512,
+                (stored_pages * page_size) as u64
+            );
+        }
     }
 
     #[test]
@@ -2385,7 +2517,7 @@ mod tests {
                 let mut opt_file = TempFile::new().unwrap().into_file();
                 opt_file.set_len(total_size as u64).unwrap();
                 guest_memory
-                    .dump_dirty(&mut opt_file, &kvm_bitmap)
+                    .dump_dirty(&mut opt_file, &kvm_bitmap, false)
                     .unwrap();
                 let opt_pos = opt_file.stream_position().unwrap();
 
