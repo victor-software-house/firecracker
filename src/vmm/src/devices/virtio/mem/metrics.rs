@@ -53,6 +53,8 @@ pub(super) struct VirtioMemDeviceMetrics {
     pub plug_bytes: SharedIncMetric,
     /// Number of Plug operations failed
     pub plug_fails: SharedIncMetric,
+    /// Number of discards failed for a Plug operation
+    pub plug_discard_fails: SharedIncMetric,
     /// Latency of Unplug operations
     pub unplug_agg: LatencyAggregateMetrics,
     /// Number of Unplug operations
@@ -88,6 +90,7 @@ impl VirtioMemDeviceMetrics {
             plug_count: SharedIncMetric::new(),
             plug_bytes: SharedIncMetric::new(),
             plug_fails: SharedIncMetric::new(),
+            plug_discard_fails: SharedIncMetric::new(),
             unplug_agg: LatencyAggregateMetrics::new(),
             unplug_count: SharedIncMetric::new(),
             unplug_bytes: SharedIncMetric::new(),

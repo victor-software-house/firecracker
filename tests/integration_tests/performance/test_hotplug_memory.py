@@ -168,7 +168,13 @@ def uvm_any_memhp(request, uvm, rootfs, microvm_factory):
 
 def validate_metrics(uvm):
     """Validates that there are no fails in the metrics"""
-    metrics_to_check = ["plug_fails", "unplug_fails", "unplug_all_fails", "state_fails"]
+    metrics_to_check = [
+        "plug_fails",
+        "plug_discard_fails",
+        "unplug_fails",
+        "unplug_all_fails",
+        "state_fails",
+    ]
     if supports_hugetlbfs_discard():
         metrics_to_check.append("unplug_discard_fails")
     uvm.flush_metrics()

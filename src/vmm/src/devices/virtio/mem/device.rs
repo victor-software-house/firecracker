@@ -495,9 +495,10 @@ impl VirtioMem {
     }
 
     /// Applies the request to a single KVM slot: updates KVM first and, only if that succeeds,
-    /// commits the block state for the blocks the request touches and (when unplugging) discards
-    /// them. Committing after the KVM update keeps the block state consistent with KVM on a partial
-    /// failure, and a block is never discarded before it is committed as unplugged.
+    /// commits the block state for the blocks the request touches and discards them when
+    /// unplugging, or when plugging into memory restored from a snapshot file. Committing after
+    /// the KVM update keeps the block state consistent with KVM on a partial failure, and a block
+    /// is never discarded before it is committed.
     ///
     /// Returns `true` if the slot's discard failed. That is not fatal and is not reported to the
     /// driver; the caller aggregates it into a single metric per request.
@@ -528,6 +529,11 @@ impl VirtioMem {
         hp_region
             .update_slot(&self.vm, &hp_region.mem_slot(slot_num), keep_plugged)
             .map_err(VirtioMemError::UpdateKvmSlot)?;
+        // A newly plugged block of a guest restored from a snapshot file is still mapped from
+        // that file, so the guest's first write to each page would read the file into the page
+        // cache and copy it, and would see whatever the file holds there. Discarding the block
+        // maps anonymous memory over it instead: the guest reads zeros and writes fresh pages.
+        let discard = !plug || hp_region.is_private_file_mapping();
 
         let plugged_before = self.plugged_blocks[touched.clone()].count_ones();
         self.plugged_blocks[touched.clone()].fill(plug);
@@ -535,7 +541,7 @@ impl VirtioMem {
         self.config.plugged_size -= usize_to_u64(self.nb_blocks_to_len(plugged_before));
         self.config.plugged_size += usize_to_u64(self.nb_blocks_to_len(plugged_after));
 
-        if !plug {
+        if discard {
             let addr =
                 GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
             if let Err(err) = self
@@ -590,7 +596,11 @@ impl VirtioMem {
                 self.apply_range_to_slot(slot_num, first_block, block_count, &req_blocks, plug)?;
         }
         if discard_failed {
-            METRICS.unplug_discard_fails.inc();
+            if plug {
+                METRICS.plug_discard_fails.inc();
+            } else {
+                METRICS.unplug_discard_fails.inc();
+            }
         }
         Ok(())
     }
@@ -787,12 +797,18 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
 
+    use std::io::Write;
+
+    use vmm_sys_util::tempfile::TempFile;
+
     use super::*;
     use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::mem::device::test_utils::default_virtio_mem;
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::test_utils::test::VirtioTestHelper;
     use crate::utils::mib_to_bytes;
+    use crate::vmm_config::machine_config::HugePageConfig;
+    use crate::vstate::memory;
     use crate::vstate::vm::tests::setup_vm_with_memory;
 
     #[test]
@@ -1100,6 +1116,48 @@ mod tests {
         assert_eq!(METRICS.plug_count.count(), plug_count + 1);
         assert_eq!(METRICS.plug_bytes.count(), plug_bytes + (2 << 20));
         assert_eq!(METRICS.plug_fails.count(), plug_fails);
+    }
+
+    #[test]
+    fn test_plug_request_discards_blocks_restored_from_file() {
+        // A guest restored from a snapshot file whose unplugged first block still holds data.
+        let addr = GuestAddress(512 << 30);
+        let block = mib_to_bytes(2);
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&vec![0xABu8; block]).unwrap();
+        file.set_len(mib_to_bytes(256) as u64).unwrap();
+        let mut vm = setup_vm_with_memory(0x1000);
+        vm.register_hotpluggable_memory_region(
+            memory::snapshot_file(
+                file,
+                std::iter::once((addr, mib_to_bytes(256))),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap(),
+            mib_to_bytes(128),
+        )
+        .unwrap();
+        let mem_dev = VirtioMem::new(Arc::new(vm), addr, 256, 2, 128).unwrap();
+        let guest_mem = mem_dev.vm.guest_memory().clone();
+        let mut th = test_helper(mem_dev, &guest_mem);
+        th.device().update_requested_size(256).unwrap();
+        let plug_discard_fails = METRICS.plug_discard_fails.count();
+
+        let resp = emulate_request(
+            &mut th,
+            &guest_mem,
+            Request::Plug(RequestedRange { addr, nb_blocks: 1 }),
+        );
+        assert!(resp.is_ack());
+        assert_eq!(METRICS.plug_discard_fails.count(), plug_discard_fails);
+
+        // The plugged block reads as fresh zeros, not as the file's data.
+        let mut contents = vec![0xFFu8; block];
+        guest_mem.read(&mut contents, addr).unwrap();
+        assert!(contents.iter().all(|&byte| byte == 0));
     }
 
     #[test]
