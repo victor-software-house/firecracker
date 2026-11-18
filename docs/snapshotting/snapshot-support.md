@@ -388,6 +388,29 @@ useful when durability isn't required (e.g. a pipeline further transforms the
 snapshot). Block device backing files are always `fsync`'d regardless of this
 setting.
 
+#### Evicting guest memory
+
+The optional `evict` field of the `PUT /snapshot/create` API, `false` by
+default, makes the snapshot free the guest's memory as it writes it, for a host
+that saves a microVM to reclaim memory. Firecracker then opens the memory file
+with `O_DIRECT` and writes guest memory in 2 MiB chunks, so the writes leave
+nothing in the host page cache. It discards each chunk from guest memory once
+the chunk is written. In a full snapshot, a chunk that reads as zero is punched
+out of the file as a hole instead of written. A diff snapshot writes the dirty
+pages of each chunk; when it merges into an existing memory file, a run of dirty
+pages that reads as zero is punched out, so a copy of the previous memory file
+keeps none of its old bytes there.
+
+When the file system refuses `O_DIRECT`, Firecracker writes through the page
+cache and drops each written chunk from it with `POSIX_FADV_DONTNEED`. It logs
+which of the two it used.
+
+An evicting snapshot leaves the microVM without its memory, so a later
+`PATCH /vm` with `"state": "Resumed"` is refused. This also holds when the
+snapshot fails after it discarded its first chunk; the memory file is then
+incomplete. Write an evicting snapshot to a new file, or to a copy of the
+previous memory file, never to the file the microVM was restored from.
+
 ### Resuming the microVM
 
 You can resume the microVM by sending the following API command:

@@ -276,6 +276,8 @@ pub enum VmmError {
     Balloon(#[from] BalloonError),
     /// Operation not supported on this VM type
     NotSupported,
+    /// The microVM cannot resume: an evicting snapshot discarded its memory.
+    MemoryEvicted,
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
 }
@@ -480,6 +482,9 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+        if kvm_vm.memory_evicted() {
+            return Err(VmmError::MemoryEvicted);
+        }
         self.device_manager.kick_virtio_devices();
         kvm_vm.resume_vcpus()?;
         self.instance_info.state = VmState::Running;
