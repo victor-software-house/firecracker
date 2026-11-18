@@ -151,6 +151,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: true,
+            evict: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -168,6 +169,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: false,
+            evict: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -183,10 +185,42 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: true,
+            evict: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
             VmmAction::CreateSnapshot(expected_config)
+        );
+
+        // `evict` is false when absent, as above, and true when set.
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_file_path": "bar",
+            "evict": true
+        }"#;
+        let expected_config = CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: PathBuf::from("foo"),
+            mem_file_path: PathBuf::from("bar"),
+            sync_snapshot_files: true,
+            evict: true,
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            VmmAction::CreateSnapshot(expected_config)
+        );
+
+        // `evict` takes only a boolean.
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_file_path": "bar",
+            "evict": "yes"
+        }"#;
+        assert!(
+            parse_put_snapshot(&Body::new(body), Some("create"))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid type: string \"yes\", expected a boolean")
         );
 
         let invalid_body = r#"{

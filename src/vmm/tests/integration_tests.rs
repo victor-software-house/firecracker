@@ -33,7 +33,7 @@ use vmm::vmm_config::snapshot::{
     SnapshotLoadHugePageConfig, SnapshotType,
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
-use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
+use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm, VmmError};
 use vmm_sys_util::tempfile::TempFile;
 
 #[allow(unused_mut, unused_variables)]
@@ -251,6 +251,7 @@ fn verify_create_snapshot(
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: memory_file.as_path().to_path_buf(),
         sync_snapshot_files: true,
+        evict: false,
     };
 
     controller
@@ -287,6 +288,64 @@ fn verify_create_snapshot(
     assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
 
     (snapshot_file, memory_file)
+}
+
+#[test]
+fn test_resume_after_evicting_snapshot_is_refused() {
+    for evict in [false, true] {
+        let snapshot_file = TempFile::new().unwrap();
+        let memory_file = TempFile::new().unwrap();
+        let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+        let mut controller = RuntimeApiController::new(vmm.clone());
+        let mut event_manager = EventManager::new().unwrap();
+        let snapshot = || {
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: memory_file.as_path().to_path_buf(),
+                sync_snapshot_files: false,
+                evict,
+            })
+        };
+
+        // Be sure that the microVM is running.
+        thread::sleep(Duration::from_millis(200));
+
+        // A running microVM refuses the snapshot, evicting or not, and keeps its memory.
+        controller
+            .handle_request(snapshot(), &mut event_manager)
+            .unwrap_err();
+        controller
+            .handle_request(VmmAction::Pause, &mut event_manager)
+            .unwrap();
+        controller
+            .handle_request(VmmAction::Resume, &mut event_manager)
+            .unwrap();
+
+        controller
+            .handle_request(VmmAction::Pause, &mut event_manager)
+            .unwrap();
+        controller
+            .handle_request(snapshot(), &mut event_manager)
+            .unwrap();
+
+        // A plain snapshot resumes; an evicting one discarded the guest's memory and refuses.
+        let resumed = controller.handle_request(VmmAction::Resume, &mut event_manager);
+        if evict {
+            assert!(
+                matches!(
+                    resumed,
+                    Err(VmmActionError::InternalVmm(VmmError::MemoryEvicted))
+                ),
+                "{resumed:?}"
+            );
+            assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Paused);
+        } else {
+            resumed.unwrap();
+        }
+
+        vmm.lock().unwrap().stop(FcExitCode::Ok);
+    }
 }
 
 fn verify_load_snapshot(

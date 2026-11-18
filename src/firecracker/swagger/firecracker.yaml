@@ -1847,6 +1847,18 @@ definitions:
           in the host page cache, so same-host reads still see the full
           contents. Block device backing files are always fsync'd regardless of
           this setting.
+      evict:
+        type: boolean
+        default: false
+        description:
+          Whether to free the guest's memory as the snapshot writes it.
+          Optional, defaults to false. With it, the memory file is written in
+          2 MiB chunks without the host page cache (O_DIRECT, or buffered
+          writes dropped from the page cache where the file system refuses
+          O_DIRECT), all-zero chunks of a full snapshot and all-zero dirty runs
+          of a diff merged into its memory file are punched out as holes, and
+          each chunk is discarded from guest memory once written. The microVM
+          cannot resume afterwards, and a resume request is refused.
 
   NetworkOverride:
     type: object

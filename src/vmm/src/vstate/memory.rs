@@ -43,6 +43,20 @@ pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 const GUEST_MEMORY_ALIGNMENT: usize = mib_to_bytes(2);
 /// A mask to extract mmap's flags related to HUGETLB
 const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HUGE_SHIFT);
+/// The size of the chunks an evicting dump writes and then discards from guest memory. A
+/// chunk of this size and alignment is a whole transparent huge page, so a discard never splits
+/// one. The last chunk of a slot may be shorter.
+pub const EVICT_CHUNK_SIZE: usize = mib_to_bytes(2);
+
+/// How an evicting dump writes the memory file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictWrite {
+    /// The file is open with `O_DIRECT`, so the writes leave nothing in the host page cache.
+    Direct,
+    /// The file system refused `O_DIRECT`, so each chunk is written through the page cache, then
+    /// written back and dropped from it with `POSIX_FADV_DONTNEED`.
+    Buffered,
+}
 
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -92,6 +106,12 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Cannot punch a hole in the snapshot memory file: {0}
     PunchHole(std::io::Error),
+    /// Cannot write the snapshot memory file: {0}
+    WriteFile(std::io::Error),
+    /// Cannot drop a written chunk of the snapshot memory file from the page cache: {0}
+    DropPageCache(std::io::Error),
+    /// Cannot discard a written chunk from guest memory: {0}
+    Discard(GuestMemoryError),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
 }
@@ -1191,6 +1211,32 @@ where
         punch_zero_pages: bool,
     ) -> Result<(), MemoryError>;
 
+    /// Dumps all contents of GuestMemoryMmap into `file` as `dump` does, in chunks of
+    /// [`EVICT_CHUNK_SIZE`], and discards each chunk from guest memory once it is written, so the
+    /// dump frees the guest's memory as it goes and the guest cannot run afterwards. A chunk that
+    /// reads as zero is punched out of the file as a hole instead of written. `file` must be as
+    /// long as guest memory. `discarded` is set before the first discard, so after an error it
+    /// tells whether guest memory is still whole.
+    fn dump_evicting(
+        &self,
+        file: &File,
+        mode: EvictWrite,
+        discarded: &mut bool,
+    ) -> Result<(), MemoryError>;
+
+    /// Dumps the pages present in `dirty_bitmap` into `file` as `dump_dirty` does, with the
+    /// same meaning of `punch_zero_pages` and the same handling of the dirty bitmap, walking
+    /// guest memory in chunks of [`EVICT_CHUNK_SIZE`] and discarding each whole chunk once its
+    /// dirty pages are written. `discarded` is set as for `dump_evicting`.
+    fn dump_dirty_evicting(
+        &self,
+        file: &File,
+        mode: EvictWrite,
+        dirty_bitmap: &DirtyBitmap,
+        punch_zero_pages: bool,
+        discarded: &mut bool,
+    ) -> Result<(), MemoryError>;
+
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self);
 
@@ -1323,6 +1369,39 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         write_result
     }
 
+    fn dump_evicting(
+        &self,
+        file: &File,
+        mode: EvictWrite,
+        discarded: &mut bool,
+    ) -> Result<(), MemoryError> {
+        dump_evicting_slots(self, &mut EvictingWriter::new(file, mode), None, discarded)
+    }
+
+    fn dump_dirty_evicting(
+        &self,
+        file: &File,
+        mode: EvictWrite,
+        dirty_bitmap: &DirtyBitmap,
+        punch_zero_pages: bool,
+        discarded: &mut bool,
+    ) -> Result<(), MemoryError> {
+        let write_result = dump_evicting_slots(
+            self,
+            &mut EvictingWriter::new(file, mode),
+            Some((dirty_bitmap, punch_zero_pages)),
+            discarded,
+        );
+
+        if write_result.is_err() {
+            self.store_dirty_bitmap(dirty_bitmap, host_page_size());
+        } else {
+            self.reset_dirty();
+        }
+
+        write_result
+    }
+
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self) {
         self.iter().for_each(|region| {
@@ -1425,6 +1504,265 @@ fn punch_hole<T: std::io::Seek + AsFd>(writer: &mut T, len: usize) -> io::Result
     Ok(())
 }
 
+/// Walks the plugged slots of `mem` in chunks of [`EVICT_CHUNK_SIZE`], writes each chunk with
+/// `writer` at its offset in the memory file, and then discards it from guest memory. Unplugged
+/// slots are skipped, leaving their range of the file as it is. Without `dirty`, every chunk is
+/// written, or punched out when it reads as zero. With `dirty`, only the dirty pages of each chunk
+/// are written, and the flag says whether a dirty run that reads as zero is punched out.
+fn dump_evicting_slots(
+    mem: &GuestMemoryMmap,
+    writer: &mut EvictingWriter<'_>,
+    dirty: Option<(&DirtyBitmap, bool)>,
+    discarded: &mut bool,
+) -> Result<(), MemoryError> {
+    let page_size = host_page_size();
+    let mut file_offset = 0u64;
+    for (mem_slot, plugged) in mem.iter().flat_map(|region| region.slots()) {
+        let slot_len = mem_slot.slice.len();
+        if plugged {
+            let dirty_slot = match dirty {
+                Some((dirty_bitmap, punch_zero_pages)) => {
+                    let kvm_bitmap = dirty_bitmap
+                        .get(&mem_slot.slot)
+                        .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
+                    check_kvm_bitmap(kvm_bitmap, slot_len / page_size)?;
+                    Some((kvm_bitmap.as_slice(), punch_zero_pages))
+                }
+                None => None,
+            };
+            let mut chunk = 0;
+            while chunk < slot_len {
+                let chunk_len = EVICT_CHUNK_SIZE.min(slot_len - chunk);
+                let at = file_offset + chunk as u64;
+                // PAGEMAP_SCAN would classify the chunk's pages here, so that untouched and
+                // zero-PFN pages become holes without being read.
+                match dirty_slot {
+                    Some((kvm_bitmap, punch_zero_pages)) => {
+                        let fc_bitmap = mem_slot.slice.bitmap();
+                        let is_dirty = |offset: usize| {
+                            let page = offset / page_size;
+                            (kvm_bitmap[page / 64] >> (page % 64)) & 1 != 0
+                                || fc_bitmap.dirty_at(offset)
+                        };
+                        let end = chunk + chunk_len;
+                        let mut start = chunk;
+                        while start < end {
+                            if !is_dirty(start) {
+                                start += page_size;
+                                continue;
+                            }
+                            let mut stop = start + page_size;
+                            while stop < end && is_dirty(stop) {
+                                stop += page_size;
+                            }
+                            let run = mem_slot.slice.subslice(start, stop - start)?;
+                            let run_at = file_offset + start as u64;
+                            if punch_zero_pages {
+                                writer.write_or_punch_pages(&run, run_at)?;
+                            } else {
+                                writer.write_at(&run, run_at)?;
+                            }
+                            start = stop;
+                        }
+                    }
+                    None => {
+                        let slice = mem_slot.slice.subslice(chunk, chunk_len)?;
+                        if writer.is_zero(&slice)? {
+                            writer.punch_at(&slice, at)?;
+                        } else {
+                            writer.write_at(&slice, at)?;
+                        }
+                    }
+                }
+                writer.drop_page_cache(at, chunk_len)?;
+                *discarded = true;
+                mem.discard_range(mem_slot.guest_addr.unchecked_add(chunk as u64), chunk_len)
+                    .map_err(MemoryError::Discard)?;
+                chunk += chunk_len;
+            }
+        }
+        file_offset += slot_len as u64;
+    }
+    Ok(())
+}
+
+/// Checks that a KVM dirty bitmap covers exactly `num_pages` pages, as `dump_dirty` does.
+fn check_kvm_bitmap(kvm_bitmap: &[u64], num_pages: usize) -> Result<(), MemoryError> {
+    let expected_len = num_pages.div_ceil(64);
+    if kvm_bitmap.len() > expected_len {
+        return Err(MemoryError::DirtyBitmapTooLarge);
+    } else if kvm_bitmap.len() < expected_len {
+        return Err(MemoryError::DirtyBitmapTooSmall);
+    }
+    let trailing_bits = num_pages % 64;
+    if trailing_bits != 0 && kvm_bitmap[expected_len - 1] >> trailing_bits != 0 {
+        return Err(MemoryError::DirtyBitmapTooLarge);
+    }
+    Ok(())
+}
+
+/// Writes guest memory at given offsets of the memory file of an evicting dump.
+struct EvictingWriter<'f> {
+    file: &'f File,
+    mode: EvictWrite,
+    /// One host page, to read pages into when checking them for zeros.
+    page: Vec<u64>,
+}
+
+impl<'f> EvictingWriter<'f> {
+    fn new(file: &'f File, mode: EvictWrite) -> Self {
+        EvictingWriter {
+            file,
+            mode,
+            page: vec![0u64; host_page_size() / std::mem::size_of::<u64>()],
+        }
+    }
+
+    /// Writes `slice` at `offset` of the file straight from guest memory, continuing after a
+    /// short write. With `O_DIRECT`, page-aligned guest memory, offsets and lengths meet the
+    /// alignment rule.
+    fn write_at<B: BitmapSlice>(
+        &self,
+        slice: &VolatileSlice<'_, B>,
+        offset: u64,
+    ) -> Result<(), MemoryError> {
+        let guard = slice.ptr_guard();
+        let base = guard.as_ptr();
+        let mut done = 0;
+        while done < slice.len() {
+            let at =
+                i64::try_from(offset + done as u64).map_err(|_| MemoryError::OffsetTooLarge)?;
+            // SAFETY: [base + done, base + len) lies in the guest memory the slice covers, which
+            // stays mapped while `guard` lives, and the descriptor belongs to `self.file`.
+            let ret = unsafe {
+                libc::pwrite(
+                    self.file.as_raw_fd(),
+                    base.add(done).cast(),
+                    slice.len() - done,
+                    at,
+                )
+            };
+            match ret {
+                0 => return Err(MemoryError::WriteFile(io::ErrorKind::WriteZero.into())),
+                written if written > 0 => done += written.cast_unsigned(),
+                _ => {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(MemoryError::WriteFile(err));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Punches the range of `slice`, which reads as zero, out of the file at `offset`. A file
+    /// system without hole punching gets the zeros written instead.
+    fn punch_at<B: BitmapSlice>(
+        &self,
+        slice: &VolatileSlice<'_, B>,
+        offset: u64,
+    ) -> Result<(), MemoryError> {
+        let at = i64::try_from(offset).map_err(|_| MemoryError::OffsetTooLarge)?;
+        let len = i64::try_from(slice.len()).map_err(|_| MemoryError::OffsetTooLarge)?;
+        // SAFETY: fallocate on a descriptor `self.file` owns, with no pointer arguments.
+        let ret = unsafe {
+            libc::fallocate(
+                self.file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                at,
+                len,
+            )
+        };
+        if ret == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EOPNOTSUPP) {
+            return Err(MemoryError::PunchHole(err));
+        }
+        self.write_at(slice, offset)
+    }
+
+    /// Whether every page of `slice` reads as zero. It stops at the first page that does not.
+    fn is_zero<B: BitmapSlice>(
+        &mut self,
+        slice: &VolatileSlice<'_, B>,
+    ) -> Result<bool, MemoryError> {
+        let page_size = std::mem::size_of_val(self.page.as_slice());
+        let mut at = 0;
+        while at < slice.len() {
+            let len = page_size.min(slice.len() - at);
+            let page = &mut self.page[..len / std::mem::size_of::<u64>()];
+            slice.subslice(at, len)?.copy_to(page);
+            if page.iter().any(|&word| word != 0) {
+                return Ok(false);
+            }
+            at += len;
+        }
+        Ok(true)
+    }
+
+    /// Writes the pages of `slice` at `offset`, punching each run of pages that read as zero
+    /// out of the file instead, as `dump_dirty` does when a diff merges into its memory file.
+    fn write_or_punch_pages<B: BitmapSlice>(
+        &mut self,
+        slice: &VolatileSlice<'_, B>,
+        offset: u64,
+    ) -> Result<(), MemoryError> {
+        let page_size = std::mem::size_of_val(self.page.as_slice());
+        let mut start = 0;
+        while start < slice.len() {
+            let zero = self.is_zero(&slice.subslice(start, page_size)?)?;
+            let mut stop = start + page_size;
+            while stop < slice.len() && self.is_zero(&slice.subslice(stop, page_size)?)? == zero {
+                stop += page_size;
+            }
+            let run = slice.subslice(start, stop - start)?;
+            let run_at = offset + start as u64;
+            if zero {
+                self.punch_at(&run, run_at)?;
+            } else {
+                self.write_at(&run, run_at)?;
+            }
+            start = stop;
+        }
+        Ok(())
+    }
+
+    /// Without `O_DIRECT`, writes the `len` bytes at `offset` back to disk and drops them from
+    /// the page cache, which holds only clean pages after the writeback.
+    fn drop_page_cache(&self, offset: u64, len: usize) -> Result<(), MemoryError> {
+        if self.mode == EvictWrite::Direct {
+            return Ok(());
+        }
+        let at = i64::try_from(offset).map_err(|_| MemoryError::OffsetTooLarge)?;
+        let len = i64::try_from(len).map_err(|_| MemoryError::OffsetTooLarge)?;
+        let fd = self.file.as_raw_fd();
+        // SAFETY: sync_file_range on a descriptor `self.file` owns, with no pointer arguments.
+        let ret = unsafe {
+            libc::sync_file_range(
+                fd,
+                at,
+                len,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            )
+        };
+        if ret != 0 {
+            return Err(MemoryError::DropPageCache(io::Error::last_os_error()));
+        }
+        // SAFETY: posix_fadvise on a descriptor `self.file` owns, with no pointer arguments.
+        let ret = unsafe { libc::posix_fadvise(fd, at, len, libc::POSIX_FADV_DONTNEED) };
+        if ret != 0 {
+            let err = io::Error::from_raw_os_error(ret);
+            return Err(MemoryError::DropPageCache(err));
+        }
+        Ok(())
+    }
+}
+
 fn create_memfd(
     mem_size: u64,
     hugetlb_size: Option<memfd::HugetlbSize>,
@@ -1478,7 +1816,8 @@ mod tests {
 
     use std::collections::HashMap;
     use std::io::{Read, Seek, Write};
-    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+    use std::path::Path;
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -2356,6 +2695,364 @@ mod tests {
         }
     }
 
+    /// Deterministic bytes with no zero byte, so a range of them never reads as zero.
+    fn pattern(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0] | 1
+            })
+            .collect()
+    }
+
+    /// Opens `path` to write an evicting dump into, with `O_DIRECT` for [`EvictWrite::Direct`].
+    fn open_for_evict(path: &Path, mode: EvictWrite) -> File {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        if mode == EvictWrite::Direct {
+            options.custom_flags(libc::O_DIRECT);
+        }
+        options.open(path).unwrap()
+    }
+
+    fn read_all(file: &File, len: usize) -> Vec<u8> {
+        let mut contents = vec![0u8; len];
+        file.read_exact_at(&mut contents, 0).unwrap();
+        contents
+    }
+
+    /// Whether `len` bytes at `offset` of `file` are a hole, so no data starts in them.
+    fn is_hole(file: &File, offset: usize, len: usize) -> bool {
+        let at = i64::try_from(offset).unwrap();
+        let data = unsafe { libc::lseek(file.as_raw_fd(), at, libc::SEEK_DATA) };
+        if data < 0 {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ENXIO));
+            return true;
+        }
+        data >= i64::try_from(offset + len).unwrap()
+    }
+
+    /// Checks that every plugged slot of `mem` reads as zero.
+    fn assert_plugged_memory_zero(mem: &GuestMemoryMmap) {
+        for (slot, plugged) in mem.iter().flat_map(|region| region.slots()) {
+            if plugged {
+                let mut contents = vec![0u8; slot.slice.len()];
+                slot.slice.copy_to(&mut contents[..]);
+                assert!(
+                    contents.iter().all(|&byte| byte == 0),
+                    "slot {} still holds data",
+                    slot.slot
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dump_evicting_full_anonymous() {
+        let page_size = host_page_size();
+        let chunk = EVICT_CHUNK_SIZE;
+        // A DRAM region of three chunks and a last chunk of three pages, then a hotpluggable
+        // region of two one-chunk slots, of which only the first is plugged.
+        let dram_size = 3 * chunk + 3 * page_size;
+        let hotplug_addr = GuestAddress(mib_to_bytes(16) as u64);
+        let dram = anonymous(
+            std::iter::once((GuestAddress(0), dram_size)),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let hotplug = anonymous(
+            std::iter::once((hotplug_addr, 2 * chunk)),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let hotplug_state = GuestMemoryRegionState {
+            base_address: hotplug_addr.0,
+            size: 2 * chunk,
+            region_type: GuestRegionType::Hotpluggable,
+            plugged: vec![true, false],
+        };
+        let mem = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmapExt::dram_from_mmap_region(dram, 0),
+            GuestRegionMmapExt::from_state(hotplug, &hotplug_state, 1).unwrap(),
+        ])
+        .unwrap();
+
+        // Chunk 0 holds data, chunk 1 is zero, chunk 2 is zero but for its last byte, the short
+        // last chunk holds data, and so does the plugged hotplug slot.
+        mem.write(&pattern(chunk, 1), GuestAddress(0)).unwrap();
+        mem.write(&[7], GuestAddress((3 * chunk - 1) as u64))
+            .unwrap();
+        mem.write(&pattern(3 * page_size, 2), GuestAddress((3 * chunk) as u64))
+            .unwrap();
+        mem.write(&pattern(chunk, 3), hotplug_addr).unwrap();
+
+        let total = dram_size + 2 * chunk;
+        let mut dumped = TempFile::new().unwrap().into_file();
+        dumped.set_len(total as u64).unwrap();
+        mem.dump(&mut dumped).unwrap();
+        let expected = read_all(&dumped, total);
+
+        let target = TempFile::new().unwrap();
+        target.as_file().set_len(total as u64).unwrap();
+        let file = open_for_evict(target.as_path(), EvictWrite::Direct);
+        let mut discarded = false;
+        mem.dump_evicting(&file, EvictWrite::Direct, &mut discarded)
+            .unwrap();
+
+        assert!(discarded);
+        assert_eq!(read_all(target.as_file(), total), expected);
+        assert!(!is_hole(&file, 0, chunk));
+        assert!(is_hole(&file, chunk, chunk));
+        assert!(!is_hole(&file, 2 * chunk, chunk));
+        assert!(!is_hole(&file, 3 * chunk, 3 * page_size));
+        assert!(!is_hole(&file, dram_size, chunk));
+        // The unplugged slot is skipped, so its range stays a hole.
+        assert!(is_hole(&file, dram_size + chunk, chunk));
+        assert_plugged_memory_zero(&mem);
+    }
+
+    #[test]
+    fn test_dump_evicting_full_private_file() {
+        let page_size = host_page_size();
+        let chunk = EVICT_CHUNK_SIZE;
+        let size = 3 * chunk;
+        // The restore file holds data in its first chunk and written zeros after it.
+        let mut restore_contents = pattern(chunk, 4);
+        restore_contents.resize(size, 0);
+        let restore = TempFile::new().unwrap();
+        restore
+            .as_file()
+            .write_all_at(&restore_contents, 0)
+            .unwrap();
+        let mem = into_region_ext(
+            snapshot_file(
+                restore.as_file().try_clone().unwrap(),
+                std::iter::once((GuestAddress(0), size)),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        // The guest writes one page of the first chunk and all of the third, so those pages are
+        // its own copies and the second chunk still reads the file's zeros.
+        mem.write(
+            &pattern(page_size, 5),
+            GuestAddress((100 * page_size) as u64),
+        )
+        .unwrap();
+        mem.write(&pattern(chunk, 6), GuestAddress((2 * chunk) as u64))
+            .unwrap();
+
+        let mut dumped = TempFile::new().unwrap().into_file();
+        dumped.set_len(size as u64).unwrap();
+        mem.dump(&mut dumped).unwrap();
+        let expected = read_all(&dumped, size);
+
+        let target = TempFile::new().unwrap();
+        target.as_file().set_len(size as u64).unwrap();
+        let file = open_for_evict(target.as_path(), EvictWrite::Direct);
+        let mut discarded = false;
+        mem.dump_evicting(&file, EvictWrite::Direct, &mut discarded)
+            .unwrap();
+
+        assert!(discarded);
+        assert_eq!(read_all(target.as_file(), size), expected);
+        assert!(is_hole(&file, chunk, chunk));
+        // Guest memory is anonymous now and reads zero, not the restore file's bytes, and the
+        // restore file is untouched.
+        let host = mem.get_host_address(GuestAddress(0)).unwrap() as u64;
+        let mappings = mappings_in(host, host + size as u64);
+        assert!(
+            mappings.iter().all(|&(_, _, file_backed)| !file_backed),
+            "{mappings:x?}"
+        );
+        assert_plugged_memory_zero(&mem);
+        assert_eq!(read_all(restore.as_file(), size), restore_contents);
+    }
+
+    #[test]
+    fn test_dump_dirty_evicting_onto_copy_of_base() {
+        let page_size = host_page_size();
+        let chunk = EVICT_CHUNK_SIZE;
+        let size = 3 * chunk;
+        let base_contents = pattern(size, 7);
+        // Pages 2 to 5 turn to zeros, and the pages from one before the second chunk to two into
+        // it change, so that run crosses a chunk boundary.
+        let zeroed = 2 * page_size..6 * page_size;
+        let changed = chunk - page_size..chunk + 2 * page_size;
+        let mut kvm_bitmap = vec![0u64; (size / page_size).div_ceil(64)];
+        for offset in zeroed.clone().chain(changed.clone()).step_by(page_size) {
+            let page = offset / page_size;
+            kvm_bitmap[page / 64] |= 1 << (page % 64);
+        }
+        let dirty_bitmap: DirtyBitmap = HashMap::from([(0, kvm_bitmap)]);
+
+        for punch_zero_pages in [true, false] {
+            let base = TempFile::new().unwrap();
+            base.as_file().write_all_at(&base_contents, 0).unwrap();
+            let target = TempFile::new().unwrap();
+            std::fs::copy(base.as_path(), target.as_path()).unwrap();
+
+            // Clean pages hold bytes other than the base's, so a write of a clean page would show.
+            let mem = into_region_ext(
+                anonymous(
+                    std::iter::once((GuestAddress(0), size)),
+                    false,
+                    HugePageConfig::None,
+                )
+                .unwrap(),
+            );
+            mem.write(&vec![0x22u8; size], GuestAddress(0)).unwrap();
+            mem.write(&vec![0u8; zeroed.len()], GuestAddress(zeroed.start as u64))
+                .unwrap();
+            mem.write(
+                &vec![0x77u8; changed.len()],
+                GuestAddress(changed.start as u64),
+            )
+            .unwrap();
+
+            let file = open_for_evict(target.as_path(), EvictWrite::Direct);
+            let mut discarded = false;
+            mem.dump_dirty_evicting(
+                &file,
+                EvictWrite::Direct,
+                &dirty_bitmap,
+                punch_zero_pages,
+                &mut discarded,
+            )
+            .unwrap();
+
+            assert!(discarded);
+            let mut expected = base_contents.clone();
+            expected[zeroed.clone()].fill(0);
+            expected[changed.clone()].fill(0x77);
+            assert_eq!(read_all(target.as_file(), size), expected);
+            // Merging into the copy punches the zeroed run; a separate layer stores its zeros.
+            assert_eq!(is_hole(&file, zeroed.start, zeroed.len()), punch_zero_pages);
+            assert_plugged_memory_zero(&mem);
+        }
+    }
+
+    #[test]
+    fn test_dump_dirty_evicting_failure_stores_dirty_bitmap() {
+        let page_size = host_page_size();
+        let chunk = EVICT_CHUNK_SIZE;
+        let mem = into_region_ext(
+            anonymous(
+                [
+                    (GuestAddress(0), chunk),
+                    (GuestAddress(chunk as u64), chunk),
+                ]
+                .into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        // Fill memory through its host address, which leaves Firecracker's dirty bitmap clean.
+        for region in mem.iter() {
+            let host = region.get_host_address(MemoryRegionAddress(0)).unwrap();
+            unsafe { std::ptr::write_bytes(host, 9, chunk) };
+        }
+        // The first page of every 64 is dirty.
+        let kvm_bitmap = vec![1u64; (chunk / page_size).div_ceil(64)];
+        let first_page_dirty = |slot: u32| {
+            let region = mem
+                .find_region(GuestAddress(u64::from(slot) * chunk as u64))
+                .unwrap();
+            let bitmap = region.bitmap();
+            (bitmap.dirty_at(0), bitmap.dirty_at(page_size))
+        };
+
+        // A file opened read-only fails the first write, before anything is discarded.
+        let target = TempFile::new().unwrap();
+        target.as_file().set_len(2 * chunk as u64).unwrap();
+        let read_only = File::open(target.as_path()).unwrap();
+        let dirty_bitmap: DirtyBitmap =
+            HashMap::from([(0, kvm_bitmap.clone()), (1, kvm_bitmap.clone())]);
+        let mut discarded = false;
+        let err = mem
+            .dump_dirty_evicting(
+                &read_only,
+                EvictWrite::Buffered,
+                &dirty_bitmap,
+                true,
+                &mut discarded,
+            )
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::WriteFile(_)), "{err}");
+        assert!(!discarded);
+        assert_eq!(first_page_dirty(0), (true, false));
+        assert_eq!(first_page_dirty(1), (true, false));
+        mem.reset_dirty();
+
+        // A bitmap too short for the second slot fails after the first slot is discarded.
+        let file = open_for_evict(target.as_path(), EvictWrite::Buffered);
+        let dirty_bitmap: DirtyBitmap = HashMap::from([(0, kvm_bitmap.clone()), (1, vec![])]);
+        let err = mem
+            .dump_dirty_evicting(
+                &file,
+                EvictWrite::Buffered,
+                &dirty_bitmap,
+                true,
+                &mut discarded,
+            )
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::DirtyBitmapTooSmall), "{err}");
+        assert!(discarded);
+        assert_eq!(first_page_dirty(0), (true, false));
+        let mut slot_0 = vec![1u8; chunk];
+        mem.read(&mut slot_0, GuestAddress(0)).unwrap();
+        assert!(slot_0.iter().all(|&byte| byte == 0));
+        let mut slot_1 = vec![0u8; chunk];
+        mem.read(&mut slot_1, GuestAddress(chunk as u64)).unwrap();
+        assert!(slot_1.iter().all(|&byte| byte == 9));
+    }
+
+    #[test]
+    fn test_dump_evicting_buffered_on_tmpfs() {
+        let page_size = host_page_size();
+        let chunk = EVICT_CHUNK_SIZE;
+        let size = 2 * chunk + page_size;
+        let mem = into_region_ext(
+            anonymous(
+                std::iter::once((GuestAddress(0), size)),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        mem.write(&pattern(chunk, 8), GuestAddress(0)).unwrap();
+        mem.write(&pattern(page_size, 9), GuestAddress((2 * chunk) as u64))
+            .unwrap();
+
+        let mut dumped = TempFile::new().unwrap().into_file();
+        dumped.set_len(size as u64).unwrap();
+        mem.dump(&mut dumped).unwrap();
+        let expected = read_all(&dumped, size);
+
+        let target = TempFile::new_in(Path::new("/dev/shm")).unwrap();
+        target.as_file().set_len(size as u64).unwrap();
+        let file = open_for_evict(target.as_path(), EvictWrite::Buffered);
+        let mut discarded = false;
+        mem.dump_evicting(&file, EvictWrite::Buffered, &mut discarded)
+            .unwrap();
+
+        assert!(discarded);
+        assert_eq!(read_all(target.as_file(), size), expected);
+        assert!(is_hole(&file, chunk, chunk));
+        assert_plugged_memory_zero(&mem);
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     mod prop_tests {
         use std::io::{Read, Seek, SeekFrom};
@@ -2637,6 +3334,99 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+
+        /// Fills each region of `guest_memory` whose slots have an odd number of pages through its
+        /// host address, which leaves Firecracker's dirty bitmap clean, and leaves the others zero.
+        /// Then dirties the pages `region_specs` selects in Firecracker's bitmap.
+        fn fill_for_evict(guest_memory: &GuestMemoryMmap, region_specs: &[RegionSpec]) {
+            let page_size = host_page_size();
+            for (region, spec) in guest_memory.iter().zip(region_specs) {
+                if spec.pages_per_slot % 2 == 1 {
+                    let ptr = region.get_host_address(MemoryRegionAddress(0)).unwrap();
+                    // SAFETY: ptr is valid for region.len() bytes.
+                    unsafe { std::ptr::write_bytes(ptr, 0xAB, u64_to_usize(region.len())) };
+                }
+                for (slot_idx, (slot, plugged)) in region.slots().enumerate() {
+                    if !plugged {
+                        continue;
+                    }
+                    for (page, dirty) in spec.fc_dirty_pages[slot_idx].iter().enumerate() {
+                        if *dirty {
+                            let addr = slot.guest_addr.0 + (page * page_size) as u64;
+                            guest_memory.write(&[0xCD], GuestAddress(addr)).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            #[test]
+            fn dump_dirty_evicting_correctness(
+                region_specs in proptest::collection::vec(region_spec(), 1..=3),
+            ) {
+                let (guest_memory, kvm_bitmap, total_size) = build_memory(&region_specs);
+                fill_for_evict(&guest_memory, &region_specs);
+
+                let mut oracle_file = TempFile::new().unwrap().into_file();
+                oracle_file.set_len(total_size as u64).unwrap();
+                dump_dirty_oracle(&guest_memory, &mut oracle_file, &kvm_bitmap);
+
+                // A separate layer stores every dirty page, zeros included, as the oracle does.
+                let target = TempFile::new().unwrap();
+                target.as_file().set_len(total_size as u64).unwrap();
+                let file = open_for_evict(target.as_path(), EvictWrite::Direct);
+                let mut discarded = false;
+                guest_memory
+                    .dump_dirty_evicting(&file, EvictWrite::Direct, &kvm_bitmap, false, &mut discarded)
+                    .unwrap();
+
+                prop_assert!(discarded == guest_memory.iter().any(|r| r.plugged_slots().next().is_some()));
+                prop_assert_eq!(
+                    read_all(target.as_file(), total_size),
+                    read_all(&oracle_file, total_size)
+                );
+                assert_plugged_memory_zero(&guest_memory);
+            }
+
+            #[test]
+            fn dump_evicting_correctness(
+                region_specs in proptest::collection::vec(region_spec(), 1..=3),
+            ) {
+                let (guest_memory, _, total_size) = build_memory(&region_specs);
+                fill_for_evict(&guest_memory, &region_specs);
+
+                let mut dumped = TempFile::new().unwrap().into_file();
+                dumped.set_len(total_size as u64).unwrap();
+                guest_memory.dump(&mut dumped).unwrap();
+
+                let target = TempFile::new().unwrap();
+                target.as_file().set_len(total_size as u64).unwrap();
+                let file = open_for_evict(target.as_path(), EvictWrite::Direct);
+                let mut discarded = false;
+                guest_memory
+                    .dump_evicting(&file, EvictWrite::Direct, &mut discarded)
+                    .unwrap();
+
+                let expected = read_all(&dumped, total_size);
+                prop_assert_eq!(read_all(target.as_file(), total_size), expected.clone());
+                // Every slot here fits in one chunk, so each plugged slot that reads as zero is a
+                // hole and takes no disk space.
+                let mut stored = 0;
+                let mut offset = 0;
+                for (slot, plugged) in guest_memory.iter().flat_map(|r| r.slots()) {
+                    let len = slot.slice.len();
+                    if plugged && expected[offset..offset + len].iter().any(|&byte| byte != 0) {
+                        stored += len;
+                    }
+                    offset += len;
+                }
+                prop_assert_eq!(file.metadata().unwrap().blocks() * 512, stored as u64);
+                assert_plugged_memory_zero(&guest_memory);
             }
         }
     }
