@@ -51,6 +51,11 @@ pub struct CreateSnapshotParams {
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
     pub sync_snapshot_files: bool,
+    /// Whether to write guest memory without the host page cache and discard each chunk of it
+    /// from the guest once it is written, so the snapshot frees the guest's memory as it goes.
+    /// The microVM cannot resume afterwards.
+    #[serde(default)]
+    pub evict: bool,
 }
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].

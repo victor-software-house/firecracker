@@ -56,6 +56,36 @@
                 ]
             },
             {
+                "syscall": "pwrite64",
+                "comment": "Used by an evicting snapshot to write each chunk of guest memory at its offset of the memory file"
+            },
+            {
+                "syscall": "fadvise64",
+                "comment": "Used by an evicting snapshot whose file system refuses O_DIRECT, to drop each written chunk from the page cache",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4,
+                        "comment": "POSIX_FADV_DONTNEED"
+                    }
+                ]
+            },
+            {
+                "syscall": "sync_file_range",
+                "comment": "Used by an evicting snapshot whose file system refuses O_DIRECT, to write each chunk back before it is dropped from the page cache",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 7,
+                        "comment": "SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER"
+                    }
+                ]
+            },
+            {
                 "syscall": "close"
             },
             {

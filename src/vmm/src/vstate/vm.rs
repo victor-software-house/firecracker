@@ -6,10 +6,11 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
@@ -28,7 +29,7 @@ use vmm_sys_util::terminal::Terminal;
 
 use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
-use crate::logger::{debug, info};
+use crate::logger::{debug, info, warn};
 use crate::nitro_enclave::enclave_vm::EnclaveVm;
 use crate::pci::PciSBDF;
 use crate::pci::msix::MsixTableEntry;
@@ -38,8 +39,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState, GuestRegionMmap,
-    GuestRegionMmapExt, MemoryError,
+    EvictWrite, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
+    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -97,6 +98,8 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// Set once an evicting snapshot has discarded guest memory, after which the guest cannot run.
+    memory_evicted: AtomicBool,
     /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
     /// to exercise partial-failure handling. 0 means never fail.
     #[cfg(test)]
@@ -222,6 +225,7 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            memory_evicted: AtomicBool::new(false),
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
         })
@@ -631,11 +635,15 @@ impl KvmVm {
     /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
     /// file of matching size, then the diff snapshot will be directly merged into the existing
     /// snapshot. Otherwise, existing files are simply overwritten.
+    ///
+    /// With `evict`, guest memory is written without the host page cache and discarded chunk by
+    /// chunk as it is written, so the guest can no longer run; see [`KvmVm::memory_evicted`].
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
         sync_snapshot_files: bool,
+        evict: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -643,12 +651,33 @@ impl KvmVm {
         let file_existed = mem_file_path.exists();
         let mut merges_into_file = false;
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(mem_file_path)
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        let (mut file, evict_write) = if evict {
+            let (file, mode) = open_evicting(|direct| {
+                let mut options = options.clone();
+                if direct {
+                    options.custom_flags(libc::O_DIRECT);
+                }
+                options.open(mem_file_path)
+            })
             .map_err(|err| MemoryBackingFile("open", err))?;
+            match mode {
+                EvictWrite::Direct => {
+                    info!("Evicting snapshot: writing the memory file with O_DIRECT")
+                }
+                EvictWrite::Buffered => warn!(
+                    "Evicting snapshot: the file system refused O_DIRECT, so the memory file is \
+                     written through the page cache and each chunk is dropped from it"
+                ),
+            }
+            (file, Some(mode))
+        } else {
+            let file = options
+                .open(mem_file_path)
+                .map_err(|err| MemoryBackingFile("open", err))?;
+            (file, None)
+        };
 
         // Determine what size our total memory area is.
         let mem_size_mib = mem_size_mib(self.guest_memory());
@@ -679,8 +708,9 @@ impl KvmVm {
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
-        match snapshot_type {
-            SnapshotType::Diff => {
+        match (snapshot_type, evict_write) {
+            (_, Some(mode)) => self.dump_evicting(&file, snapshot_type, mode, merges_into_file)?,
+            (SnapshotType::Diff, None) => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
                 // A diff merged into the full memory file punches a hole for each dirty page that
                 // reads as zero, such as a page the guest freed since the last snapshot, so the
@@ -689,7 +719,7 @@ impl KvmVm {
                 self.guest_memory()
                     .dump_dirty(&mut file, &dirty_bitmap, merges_into_file)?;
             }
-            SnapshotType::Full => {
+            (SnapshotType::Full, None) => {
                 self.guest_memory().dump(&mut file)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
@@ -703,6 +733,48 @@ impl KvmVm {
                 .map_err(|err| MemoryBackingFile("sync_all", err))?;
         }
         Ok(())
+    }
+
+    /// Dumps guest memory into `file` and discards it as it goes, then marks the guest's memory
+    /// evicted. A dump that fails after its first discard marks it evicted too, since the guest's
+    /// memory is no longer whole.
+    fn dump_evicting(
+        &self,
+        file: &File,
+        snapshot_type: SnapshotType,
+        mode: EvictWrite,
+        merges_into_file: bool,
+    ) -> Result<(), CreateSnapshotError> {
+        let mut discarded = false;
+        let dumped = match snapshot_type {
+            // A diff onto a copy of the previous memory file punches each dirty run that reads
+            // as zero, so the file keeps none of the previous file's bytes there.
+            SnapshotType::Diff => self
+                .get_dirty_bitmap()
+                .map_err(Into::into)
+                .and_then(|bitmap| {
+                    self.guest_memory()
+                        .dump_dirty_evicting(file, mode, &bitmap, merges_into_file, &mut discarded)
+                        .map_err(Into::into)
+                }),
+            SnapshotType::Full => self
+                .guest_memory()
+                .dump_evicting(file, mode, &mut discarded)
+                .map(|()| {
+                    self.reset_dirty_bitmap();
+                    self.guest_memory().reset_dirty();
+                })
+                .map_err(Into::into),
+        };
+        if discarded || dumped.is_ok() {
+            self.common.memory_evicted.store(true, Ordering::Release);
+        }
+        dumped
+    }
+
+    /// Whether an evicting snapshot has discarded guest memory, so the guest cannot run again.
+    pub fn memory_evicted(&self) -> bool {
+        self.common.memory_evicted.load(Ordering::Acquire)
     }
 
     /// Register a device IRQ
@@ -806,6 +878,21 @@ impl KvmVm {
     }
 }
 
+/// Opens the memory file of an evicting snapshot through `open`, which takes whether to add
+/// `O_DIRECT`. A file system that refuses `O_DIRECT` with `EINVAL`, as tmpfs did before Linux
+/// 6.6, gets the file opened without it.
+fn open_evicting(
+    open: impl Fn(bool) -> std::io::Result<File>,
+) -> std::io::Result<(File, EvictWrite)> {
+    match open(true) {
+        Ok(file) => Ok((file, EvictWrite::Direct)),
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+            Ok((open(false)?, EvictWrite::Buffered))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
 /// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
 fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
@@ -871,6 +958,63 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    #[test]
+    fn test_open_evicting_falls_back_without_o_direct() {
+        let temp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        // Opens the file, failing with `refuse` when asked for O_DIRECT.
+        let open = |refuse: Option<i32>| {
+            let path = temp.as_path().to_path_buf();
+            move |direct: bool| match refuse {
+                Some(errno) if direct => Err(std::io::Error::from_raw_os_error(errno)),
+                _ => OpenOptions::new().write(true).open(&path),
+            }
+        };
+        assert_eq!(open_evicting(open(None)).unwrap().1, EvictWrite::Direct);
+        // A file system without O_DIRECT gets a buffered file.
+        assert_eq!(
+            open_evicting(open(Some(libc::EINVAL))).unwrap().1,
+            EvictWrite::Buffered
+        );
+        // Any other error is returned.
+        assert_eq!(
+            open_evicting(open(Some(libc::EACCES)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
+
+    #[test]
+    fn test_snapshot_memory_to_file_evict() {
+        use vm_memory::Bytes;
+
+        let mem_size = mib_to_bytes(4);
+        for snapshot_type in [SnapshotType::Full, SnapshotType::Diff] {
+            for evict in [false, true] {
+                let vm = setup_vm_with_memory(mem_size);
+                vm.guest_memory()
+                    .write(&vec![5u8; mem_size], GuestAddress(0))
+                    .unwrap();
+                let memory_file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+                vm.snapshot_memory_to_file(memory_file.as_path(), snapshot_type, false, evict)
+                    .unwrap();
+
+                // Both write the guest's memory; only the evicting snapshot discards it.
+                assert_eq!(
+                    std::fs::read(memory_file.as_path()).unwrap(),
+                    vec![5u8; mem_size]
+                );
+                assert_eq!(vm.memory_evicted(), evict);
+                let mut contents = vec![0u8; mem_size];
+                vm.guest_memory()
+                    .read(&mut contents, GuestAddress(0))
+                    .unwrap();
+                let expected = if evict { 0 } else { 5 };
+                assert!(contents.iter().all(|&byte| byte == expected));
+            }
+        }
     }
 
     #[test]

@@ -190,6 +190,7 @@ pub fn create_snapshot(
         &params.mem_file_path,
         params.snapshot_type,
         params.sync_snapshot_files,
+        params.evict,
     )?;
 
     // We need to mark queues as dirty again for all activated devices. The reason we
