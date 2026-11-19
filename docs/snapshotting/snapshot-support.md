@@ -321,12 +321,14 @@ when configuring the `/machine-config` resource or when restoring from a
 snapshot via `/snapshot/load`, Firecracker will use KVM's dirty page log runtime
 functionality to ensure the diff snapshot only contains exactly pages that were
 written to since boot / snapshot restoration. If `track_dirty_pages` is not
-enabled, Firecracker uses the [`mincore(2)`][man mincore] syscall to determine
-which pages to include in the snapshot. As such, this mode of snapshot taking
-will only work _if swap is disabled_, as mincore does not consider pages written
-to swap to be "in core". This potentially results in bigger memory files
-(although they are still sparse), but avoids the runtime overhead of dirty page
-logging.
+enabled, Firecracker reads `/proc/self/pagemap` to determine which pages to
+include in the snapshot. The page set holds every page the guest wrote,
+including pages the host has swapped out. A page the guest only read from the
+snapshot file it was restored from is left out. This avoids the runtime overhead
+of dirty page logging, but the set does not reset after a snapshot: the next
+diff holds every page written since the microVM was restored, not only those
+written since that snapshot. Under the [jailer](../jailer.md), the jailer mounts
+the `/proc` that Firecracker reads.
 
 > [!NOTE]
 >
@@ -729,4 +731,3 @@ For example, a snapshot taken on a m6i.metal host (Intel Ice Lake) running a
 host kernel (but not vice versa), but could not be restored on a m5n.metal host
 (Intel Cascade Lake).
 
-[man mincore]: https://man7.org/linux/man-pages/man2/mincore.2.html

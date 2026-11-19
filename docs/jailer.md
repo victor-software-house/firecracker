@@ -139,6 +139,12 @@ After starting, the Jailer goes through the following operations:
   and call `chroot` into the current directory.
 - Use `mknod` to create a `/dev/net/tun` equivalent inside the jail.
 - Use `mknod` to create a `/dev/kvm` equivalent inside the jail.
+- Create `/proc` with mode `0555` and mount a procfs on it with
+  `MS_NOSUID | MS_NODEV | MS_NOEXEC` and the options
+  `hidepid=invisible,subset=pid`. A process sees only the pids of its own uid,
+  so the jailed Firecracker sees only itself, and no `/proc` entry that is not a
+  pid other than `self` and `thread-self`. Firecracker reads
+  `/proc/self/pagemap` to take a diff snapshot without dirty page tracking.
 - Use `chown` to change ownership of the `<chroot_dir>` (root path `/` as seen
   by the jailed firecracker), `/dev/net/tun`, `/dev/kvm`. The ownership is
   changed to the provided `<uid>:<gid>`.

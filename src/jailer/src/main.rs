@@ -104,6 +104,8 @@ pub enum JailerError {
     MknodDev(io::Error, String),
     #[error("Failed to bind mount the jail root directory: {0}")]
     MountBind(io::Error),
+    #[error("Failed to mount procfs inside the jail: {0}")]
+    MountProc(io::Error),
     #[error("Failed to change the propagation type to slave: {0}")]
     MountPropagationSlave(io::Error),
     #[error("{}", format!("{:?} is not a file", .0).replace('\"', ""))]

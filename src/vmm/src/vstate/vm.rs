@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -127,8 +127,8 @@ pub enum VmError {
     NotEnoughMemorySlots(u32),
     /// Failed to add a memory region: {0}
     InsertRegion(#[from] vm_memory::GuestRegionCollectionError),
-    /// Error calling mincore: {0}
-    Mincore(vmm_sys_util::errno::Error),
+    /// Failed to read /proc/self/pagemap: {0}
+    PagemapRead(#[source] std::io::Error),
     /// ResourceAllocator error: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
@@ -609,7 +609,11 @@ impl KvmVm {
     }
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
+    ///
+    /// A slot without dirty tracking takes its page set from `/proc/self/pagemap`, which this
+    /// opens once for all of the slots.
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
+        let mut pagemap: Option<File> = None;
         self.guest_memory()
             .iter()
             .flat_map(|region| region.plugged_slots())
@@ -619,10 +623,16 @@ impl KvmVm {
                         .fd()
                         .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
                         .map_err(VmError::GetDirtyLog)?,
-                    None => mincore_bitmap(
-                        mem_slot.slice.ptr_guard_mut().as_ptr(),
-                        mem_slot.slice.len(),
-                    )?,
+                    None => {
+                        if pagemap.is_none() {
+                            pagemap = Some(File::open(PAGEMAP_PATH).map_err(VmError::PagemapRead)?);
+                        }
+                        pagemap_bitmap(
+                            pagemap.as_mut().expect("opened above"),
+                            mem_slot.slice.ptr_guard_mut().as_ptr(),
+                            mem_slot.slice.len(),
+                        )?
+                    }
                 };
                 Ok((mem_slot.slot, bitmap))
             })
@@ -893,36 +903,55 @@ fn open_evicting(
     }
 }
 
-/// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
-/// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
-fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
-    // TODO: Once Host 5.10 goes out of support, we can make this more robust and work on
-    // swap-enabled systems, by doing mlock2(MLOCK_ONFAULT)/munlock() in this function (to
-    // force swapped-out pages to get paged in, so that mincore will consider them incore).
-    // However, on AMD (m6a/m7a) 5.10, doing so introduces a 100%/30ms regression to snapshot
-    // creation, even if swap is disabled, so currently it cannot be done.
+/// The file the VMM reads to tell the pages the guest wrote from the pages it only read.
+const PAGEMAP_PATH: &str = "/proc/self/pagemap";
+/// A `/proc/<pid>/pagemap` entry: the page is present in RAM.
+const PAGEMAP_PRESENT: u64 = 1 << 63;
+/// A `/proc/<pid>/pagemap` entry: the page is in swap.
+const PAGEMAP_SWAPPED: u64 = 1 << 62;
+/// A `/proc/<pid>/pagemap` entry: the page is a file page or shared anonymous.
+const PAGEMAP_FILE_OR_SHARED: u64 = 1 << 61;
+/// How many `pagemap` entries one `read` fetches.
+const PAGEMAP_CHUNK_ENTRIES: usize = 8192;
 
-    // Mincore always works at PAGE_SIZE granularity, even if the VMA we are dealing with
-    // is a hugetlbfs VMA (e.g. to report a single hugepage as "present", mincore will
-    // give us 512 4k markers with the lowest bit set).
+/// Whether the page that a `/proc/<pid>/pagemap` entry describes holds data the guest wrote.
+///
+/// A page of a private mapping that the guest wrote is an anonymous copy, either present or in
+/// swap. A page it only read stays a page of the file, which has bit 61 set. An absent page, with
+/// no bit set, holds nothing the guest wrote.
+fn pagemap_entry_written(entry: u64) -> bool {
+    entry & PAGEMAP_SWAPPED != 0
+        || (entry & PAGEMAP_PRESENT != 0 && entry & PAGEMAP_FILE_OR_SHARED == 0)
+}
+
+/// Reads the pages the guest wrote in the memslot at `addr`, `len` bytes long, from the
+/// `/proc/self/pagemap` file `pagemap`, as a bitmap with one bit for each page. To be used if a
+/// diff snapshot is requested, but dirty page tracking wasn't enabled.
+///
+/// The set holds every page written since the memory was mapped, swapped out ones included, and
+/// no page that was only read from the file backing a private mapping. It does not reset after a
+/// snapshot, as KVM's dirty log does.
+fn pagemap_bitmap(pagemap: &mut File, addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
     let page_size = host_page_size();
-    let mut mincore_bitmap = vec![0u8; len / page_size];
-    let mut bitmap = vec![0u64; (len / page_size).div_ceil(64)];
+    let pages = len / page_size;
+    let mut bitmap = vec![0u64; pages.div_ceil(64)];
 
-    // SAFETY: The safety invariants of GuestRegionMmap ensure that region.as_ptr() is a valid
-    // userspace mapping of size region.len() bytes. The bitmap has exactly one byte for each
-    // page in this userspace mapping. Note that mincore does not operate on bitmaps like
-    // KVM_MEM_LOG_DIRTY_PAGES, but rather it uses 8 bits per page (e.g. 1 byte), setting the
-    // least significant bit to 1 if the page corresponding to a byte is in core (available in
-    // the page cache and resolvable via just a minor page fault).
-    let r = unsafe { libc::mincore(addr.cast(), len, mincore_bitmap.as_mut_ptr()) };
+    // The file holds one 8 byte entry for each page of the address space.
+    let offset = (addr as usize / page_size) as u64 * 8;
+    pagemap
+        .seek(SeekFrom::Start(offset))
+        .map_err(VmError::PagemapRead)?;
 
-    if r != 0 {
-        return Err(VmError::Mincore(vmm_sys_util::errno::Error::last()));
-    }
-
-    for (page_idx, b) in mincore_bitmap.iter().enumerate() {
-        bitmap[page_idx / 64] |= (*b as u64 & 0x1) << (page_idx as u64 % 64);
+    let mut entries = vec![0u8; PAGEMAP_CHUNK_ENTRIES.min(pages) * 8];
+    let mut page_idx = 0;
+    while page_idx < pages {
+        let chunk = &mut entries[..PAGEMAP_CHUNK_ENTRIES.min(pages - page_idx) * 8];
+        pagemap.read_exact(chunk).map_err(VmError::PagemapRead)?;
+        for entry in chunk.chunks_exact(8) {
+            let entry = u64::from_ne_bytes(entry.try_into().expect("chunks of 8 bytes"));
+            bitmap[page_idx / 64] |= u64::from(pagemap_entry_written(entry)) << (page_idx % 64);
+            page_idx += 1;
+        }
     }
 
     Ok(bitmap)
@@ -931,9 +960,11 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::assert_matches;
+    use std::os::fd::AsRawFd;
     use std::sync::atomic::Ordering;
 
     use vm_memory::GuestAddress;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::arch;
@@ -1401,5 +1432,218 @@ pub(crate) mod tests {
             .allocate(1024, 1024, AllocPolicy::FirstMatch)
             .unwrap();
         assert_eq!(range + 1024, range_new.start());
+    }
+
+    #[test]
+    fn test_pagemap_entry_written() {
+        // Each entry also carries a page frame number or swap offset in its low bits.
+        let table = [
+            ("present anonymous", PAGEMAP_PRESENT | 0x1234, true),
+            (
+                "present file",
+                PAGEMAP_PRESENT | PAGEMAP_FILE_OR_SHARED | 0x1234,
+                false,
+            ),
+            ("swapped", PAGEMAP_SWAPPED | 0x1234, true),
+            ("absent", 0, false),
+            ("absent with a stale frame number", 0x1234, false),
+            (
+                "present with bit 61 set",
+                PAGEMAP_PRESENT | PAGEMAP_FILE_OR_SHARED,
+                false,
+            ),
+        ];
+        for (name, entry, written) in table {
+            assert_eq!(pagemap_entry_written(entry), written, "{name}");
+        }
+    }
+
+    /// The pages of a bitmap that are set.
+    fn set_pages(bitmap: &[u64]) -> Vec<usize> {
+        (0..bitmap.len() * 64)
+            .filter(|page| (bitmap[page / 64] >> (page % 64)) & 1 == 1)
+            .collect()
+    }
+
+    /// Maps `pages` pages of `fd` (or anonymous memory without it) privately, read and write.
+    fn map_private(fd: Option<&File>, pages: usize) -> *mut u8 {
+        let flags = match fd {
+            Some(_) => libc::MAP_PRIVATE,
+            None => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        };
+        // SAFETY: Anonymous or file-backed mapping with a null hint and a valid descriptor, which
+        // the tests unmap with `unmap`.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                pages * host_page_size(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                fd.map_or(-1, |fd| fd.as_raw_fd()),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // No huge page may make a write present in the pages around it.
+        // SAFETY: The range was mapped just above.
+        let ret = unsafe { libc::madvise(addr, pages * host_page_size(), libc::MADV_NOHUGEPAGE) };
+        assert_eq!(ret, 0);
+        addr.cast()
+    }
+
+    fn unmap(addr: *mut u8, pages: usize) {
+        // SAFETY: `addr` came from `map_private` with the same number of pages.
+        let ret = unsafe { libc::munmap(addr.cast(), pages * host_page_size()) };
+        assert_eq!(ret, 0);
+    }
+
+    #[test]
+    fn test_pagemap_bitmap_private_file_mapping() {
+        const PAGES: usize = 8;
+        let page_size = host_page_size();
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&vec![0x5a; PAGES * page_size]).unwrap();
+        let addr = map_private(Some(&file), PAGES);
+
+        // The guest reads pages 1 and 3 and writes pages 2 and 5. A page that was only read stays
+        // a page of the file.
+        for page in [1, 3] {
+            // SAFETY: `page` lies within the mapping.
+            assert_eq!(unsafe { addr.add(page * page_size).read_volatile() }, 0x5a);
+        }
+        for page in [2, 5] {
+            // SAFETY: `page` lies within the mapping.
+            unsafe { addr.add(page * page_size).write_volatile(0x42) };
+        }
+
+        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
+        let bitmap = pagemap_bitmap(&mut pagemap, addr, PAGES * page_size).unwrap();
+        assert_eq!(set_pages(&bitmap), [2, 5]);
+        unmap(addr, PAGES);
+    }
+
+    #[test]
+    fn test_pagemap_bitmap_anonymous_mapping() {
+        const PAGES: usize = 8;
+        let page_size = host_page_size();
+        let addr = map_private(None, PAGES);
+
+        // Pages 1 and 6 are written. Page 4 is only read, which maps the zero page: it counts as
+        // written and the merge of a diff punches it out, since it reads as zeros.
+        for page in [1, 6] {
+            // SAFETY: `page` lies within the mapping.
+            unsafe { addr.add(page * page_size).write_volatile(0x42) };
+        }
+        // SAFETY: Page 4 lies within the mapping.
+        assert_eq!(unsafe { addr.add(4 * page_size).read_volatile() }, 0);
+
+        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
+        let bitmap = pagemap_bitmap(&mut pagemap, addr, PAGES * page_size).unwrap();
+        assert_eq!(set_pages(&bitmap), [1, 4, 6]);
+        unmap(addr, PAGES);
+    }
+
+    #[test]
+    fn test_pagemap_bitmap_spans_chunks() {
+        // Two chunks of entries and a partial third, with pages written on both sides of each
+        // chunk's edge.
+        let pages = PAGEMAP_CHUNK_ENTRIES * 2 + 100;
+        let page_size = host_page_size();
+        let addr = map_private(None, pages);
+        let written = [
+            0,
+            PAGEMAP_CHUNK_ENTRIES - 1,
+            PAGEMAP_CHUNK_ENTRIES,
+            2 * PAGEMAP_CHUNK_ENTRIES - 1,
+            2 * PAGEMAP_CHUNK_ENTRIES,
+            pages - 1,
+        ];
+        for page in written {
+            // SAFETY: `page` lies within the mapping.
+            unsafe { addr.add(page * page_size).write_volatile(0x42) };
+        }
+
+        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
+        let bitmap = pagemap_bitmap(&mut pagemap, addr, pages * page_size).unwrap();
+        assert_eq!(set_pages(&bitmap), written);
+        unmap(addr, pages);
+    }
+
+    /// A guest whose vCPU writes pages 3, 5, 6 and 12 of its memory and reads pages 8 and 9,
+    /// with dirty tracking on over a private mapping of a file. Every page that KVM's dirty log
+    /// holds is in the page set that `pagemap_bitmap` reads, and both are the written pages.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_pagemap_bitmap_holds_kvm_dirty_log() {
+        use kvm_ioctls::VcpuExit;
+
+        use crate::vstate::memory::snapshot_file;
+
+        const PAGES: usize = 16;
+        const WRITTEN: [usize; 4] = [3, 5, 6, 12];
+        const READ: [usize; 2] = [8, 9];
+        let page_size = host_page_size();
+
+        // A real mode program: `mov byte [addr], 0x42` for each written page, `mov al, [addr]`
+        // for each page it reads, then `hlt`, which exits to this thread as no irqchip exists.
+        let address = |page: usize| u16::try_from(page * page_size).unwrap().to_le_bytes();
+        let mut program = Vec::new();
+        for page in WRITTEN {
+            program.extend([0xc6, 0x06]);
+            program.extend(address(page));
+            program.push(0x42);
+        }
+        for page in READ {
+            program.push(0xa0);
+            program.extend(address(page));
+        }
+        program.push(0xf4);
+
+        let mut memory = vec![0x5a; PAGES * page_size];
+        memory[..program.len()].copy_from_slice(&program);
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&memory).unwrap();
+        let regions = snapshot_file(
+            file,
+            [(GuestAddress(0), PAGES * page_size)].into_iter(),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let mut vm = setup_vm();
+        vm.register_dram_memory_regions(regions).unwrap();
+
+        let mut vcpu = vm.fd().create_vcpu(0).unwrap();
+        let mut sregs = vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        vcpu.set_sregs(&sregs).unwrap();
+        let mut regs = vcpu.get_regs().unwrap();
+        regs.rip = 0;
+        regs.rflags = 2;
+        vcpu.set_regs(&regs).unwrap();
+        assert!(matches!(vcpu.run().unwrap(), VcpuExit::Hlt));
+
+        let slot = vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .next()
+            .unwrap();
+        let mut pagemap = File::open(PAGEMAP_PATH).unwrap();
+        let from_pagemap = pagemap_bitmap(
+            &mut pagemap,
+            slot.slice.ptr_guard_mut().as_ptr(),
+            slot.slice.len(),
+        )
+        .unwrap();
+        let from_kvm = vm.get_dirty_bitmap().unwrap().remove(&slot.slot).unwrap();
+
+        let logged = set_pages(&from_kvm);
+        assert_eq!(logged, WRITTEN);
+        for page in &logged {
+            assert!(set_pages(&from_pagemap).contains(page), "page {page}");
+        }
+        assert_eq!(set_pages(&from_pagemap), WRITTEN);
     }
 }

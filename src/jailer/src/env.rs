@@ -16,10 +16,10 @@ use utils::time::{ClockType, get_time_us};
 use utils::{arg_parser, validators};
 use vmm_sys_util::syscall::SyscallReturnCode;
 
-use crate::JailerError;
 use crate::cgroup::{CgroupConfiguration, CgroupConfigurationBuilder};
 use crate::chroot::chroot;
 use crate::resource_limits::{FSIZE_ARG, NO_FILE_ARG, ResourceLimits};
+use crate::{JailerError, to_cstring};
 
 pub const PROC_MOUNTS: &str = "/proc/mounts";
 
@@ -69,6 +69,13 @@ const DEV_NE_MAJOR: u32 = 10;
 // to walk through the entire folder hierarchy.
 const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
+
+// The procfs the jailed process reads its own /proc/self/pagemap from. With `hidepid=invisible`
+// a process sees only the pids of its own uid, which is itself in the jail, and `subset=pid`
+// hides every entry of /proc that is not a pid, other than `self` and `thread-self`.
+const PROC_DIR: &str = "/proc";
+const PROC_PERMISSIONS: u32 = 0o555;
+const PROC_MOUNT_OPTIONS: &CStr = c"hidepid=invisible,subset=pid";
 
 // When running with `--new-pid-ns` flag, the PID of the process running the exec_file differs
 // from jailer's and it is stored inside a dedicated file, prefixed with the below extension.
@@ -496,6 +503,28 @@ impl Env {
             .map_err(|err| JailerError::ChangeFileOwner(folder_path.to_owned(), err))
     }
 
+    /// Creates `proc_dir` and mounts a procfs on it that shows the process only itself.
+    fn mount_proc(proc_dir: &Path) -> Result<(), JailerError> {
+        fs::create_dir_all(proc_dir)
+            .map_err(|err| JailerError::CreateDir(proc_dir.to_owned(), err))?;
+        fs::set_permissions(proc_dir, Permissions::from_mode(PROC_PERMISSIONS))
+            .map_err(|err| JailerError::Chmod(proc_dir.to_owned(), err))?;
+
+        let target = to_cstring(proc_dir)?;
+        // SAFETY: Safe because we provide valid, null-terminated parameters.
+        SyscallReturnCode(unsafe {
+            libc::mount(
+                c"proc".as_ptr(),
+                target.as_ptr(),
+                c"proc".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                PROC_MOUNT_OPTIONS.as_ptr().cast(),
+            )
+        })
+        .into_empty_result()
+        .map_err(JailerError::MountProc)
+    }
+
     fn copy_exec_to_chroot(&mut self) -> Result<OsString, JailerError> {
         let exec_file_name = self
             .exec_file_path
@@ -714,6 +743,9 @@ impl Env {
                 );
                 println!("MMDS version 2 will not be available to use.");
             });
+
+        // Firecracker reads /proc/self/pagemap to take a diff snapshot without dirty page tracking.
+        Env::mount_proc(Path::new(PROC_DIR))?;
 
         // If we have a minor version for /dev/userfaultfd the device is present on the host.
         // Expose the device in the jailed environment.
@@ -1505,5 +1537,60 @@ mod tests {
         let stored_pid = fs::read_to_string(pid_file_name);
         fs::remove_file(pid_file_name).unwrap();
         assert_eq!(stored_pid.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_mount_proc() {
+        // Like the jailer, the test thread unshares into a mount namespace of its own, so the
+        // mount never reaches the host's.
+        // SAFETY: Safe because we provide valid parameters.
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, 0);
+        // SAFETY: Safe because we provide valid parameters.
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_PRIVATE | libc::MS_REC,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+
+        let tmp_dir = TempDir::new().unwrap();
+        let proc_dir = tmp_dir.as_path().join("proc");
+        Env::mount_proc(&proc_dir).unwrap();
+
+        // The mount shows only the pid directories, with the flags and options the jailer sets.
+        let mountinfo = read_to_string("/proc/thread-self/mountinfo").unwrap();
+        let mount_point = proc_dir.to_str().unwrap();
+        let line = mountinfo
+            .lines()
+            .find(|line| line.split(' ').nth(4) == Some(mount_point))
+            .unwrap();
+        let (mount, filesystem) = line.split_once(" - ").unwrap();
+        let mount_options: Vec<_> = mount.split(' ').nth(5).unwrap().split(',').collect();
+        for option in ["nosuid", "nodev", "noexec"] {
+            assert!(mount_options.contains(&option), "{option} in {line}");
+        }
+        let filesystem: Vec<_> = filesystem.split(' ').collect();
+        assert_eq!(filesystem[0], "proc");
+        let super_options: Vec<_> = filesystem[2].split(',').collect();
+        for option in ["hidepid=invisible", "subset=pid"] {
+            assert!(super_options.contains(&option), "{option} in {line}");
+        }
+        assert!(proc_dir.join("self/pagemap").exists());
+        assert!(!proc_dir.join("meminfo").exists());
+
+        // The directory below the mount has the mode the jailer gives it.
+        let target = to_cstring(&proc_dir).unwrap();
+        // SAFETY: Safe because we provide valid parameters.
+        assert_eq!(unsafe { libc::umount2(target.as_ptr(), 0) }, 0);
+        assert_eq!(
+            fs::metadata(&proc_dir).unwrap().permissions().mode(),
+            PROC_PERMISSIONS | libc::S_IFDIR
+        );
     }
 }
